@@ -61,13 +61,22 @@ const audioBank = new Map<string, {audioBase64: string; audioMimeType: string; t
 
 let roundRobinKeyIndex = 0;
 
+const VOICE_DESIGN_ID_REGEX = /^voice_[A-Za-z0-9_-]+$/;
+
+function isValidSantaTtsVoice(candidate: string): boolean {
+  return (
+    (ACCEPTED_TTS_VOICES as readonly string[]).includes(candidate) ||
+    VOICE_DESIGN_ID_REGEX.test(candidate)
+  );
+}
+
 function resolveSantaTtsVoice(requestedVoice?: string): string {
-  const candidate = (requestedVoice || process.env.GEMINI_TTS_VOICE || 'Algenib').trim();
-  if ((ACCEPTED_TTS_VOICES as readonly string[]).includes(candidate)) {
-    return candidate;
+  const requested = (requestedVoice || '').trim();
+  if (requested && isValidSantaTtsVoice(requested)) {
+    return requested;
   }
   const envVoice = (process.env.GEMINI_TTS_VOICE || '').trim();
-  if ((ACCEPTED_TTS_VOICES as readonly string[]).includes(envVoice)) {
+  if (envVoice && isValidSantaTtsVoice(envVoice)) {
     return envVoice;
   }
   return 'Algenib';
@@ -88,16 +97,21 @@ function lookupDiskAudioBank(
   const slug = normalizeAudioBankSlug(childName);
   if (!slug) return null;
   const bankDir = path.resolve(__dirname, 'public', 'audio', 'bank');
-  const candidates = [`ola_${slug}.mp3`, `${slug}.mp3`];
-  for (const filename of candidates) {
-    const fullPath = path.join(bankDir, filename);
+  const candidates = [
+    {filename: `ola_${slug}.wav`, mimeType: 'audio/wav'},
+    {filename: `${slug}.wav`, mimeType: 'audio/wav'},
+    {filename: `ola_${slug}.mp3`, mimeType: 'audio/mpeg'},
+    {filename: `${slug}.mp3`, mimeType: 'audio/mpeg'},
+  ];
+  for (const candidate of candidates) {
+    const fullPath = path.join(bankDir, candidate.filename);
     if (fs.existsSync(fullPath)) {
       const buf = fs.readFileSync(fullPath);
       if (buf.length > 100) {
         return {
           audioBase64: buf.toString('base64'),
-          audioMimeType: 'audio/mpeg',
-          filePath: `/audio/bank/${filename}`,
+          audioMimeType: candidate.mimeType,
+          filePath: `/audio/bank/${candidate.filename}`,
         };
       }
     }
@@ -179,6 +193,63 @@ function extractReadableError(err: unknown): string {
   return raw;
 }
 
+function isAbortError(err: unknown): boolean {
+  if (!err) return false;
+  if (err instanceof Error && err.name === 'AbortError') return true;
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('ABORTED') || msg.includes('AbortError') || msg.includes('aborted');
+}
+
+function linkAbortSignal(
+  externalSignal: AbortSignal | undefined,
+  targetController: AbortController
+): () => void {
+  if (!externalSignal) return () => undefined;
+  if (externalSignal.aborted) {
+    targetController.abort();
+    return () => undefined;
+  }
+  const onAbort = () => targetController.abort();
+  externalSignal.addEventListener('abort', onAbort, {once: true});
+  return () => externalSignal.removeEventListener('abort', onAbort);
+}
+
+function createRequestAbortController(req: Request, res: Response): {
+  controller: AbortController;
+  cleanup: () => void;
+} {
+  const controller = new AbortController();
+  const abortIfDisconnected = () => {
+    if (
+      !res.writableFinished &&
+      (req.aborted || !req.complete || req.socket?.destroyed || res.destroyed)
+    ) {
+      controller.abort();
+    }
+  };
+  const onReqAborted = () => {
+    controller.abort();
+  };
+  const onResClose = () => {
+    if (!res.writableFinished) {
+      controller.abort();
+    }
+  };
+
+  req.on('close', abortIfDisconnected);
+  req.on('aborted', onReqAborted);
+  res.on('close', onResClose);
+
+  return {
+    controller,
+    cleanup: () => {
+      req.off('close', abortIfDisconnected);
+      req.off('aborted', onReqAborted);
+      res.off('close', onResClose);
+    },
+  };
+}
+
 function isRateLimitError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message : String(err);
   return msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
@@ -197,13 +268,17 @@ function isTransientError(err: unknown): boolean {
 async function withKeyRotationRetry<T>(
   fn: (apiKey: string) => Promise<T>,
   maxAttempts = 3,
-  rateLimitDelayMs = 1200
+  rateLimitDelayMs = 1200,
+  externalSignal?: AbortSignal
 ): Promise<T> {
   const keys = getConfiguredApiKeys();
   const baseKey = getNextApiKey(0);
   let lastErr: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    if (externalSignal?.aborted) {
+      throw new Error('ABORTED: Requisição cancelada pelo cliente.');
+    }
     const attemptKey =
       attempt === 1
         ? baseKey
@@ -214,6 +289,9 @@ async function withKeyRotationRetry<T>(
       return await fn(attemptKey);
     } catch (err) {
       lastErr = err;
+      if (externalSignal?.aborted || isAbortError(err)) {
+        throw err;
+      }
       if (!isTransientError(err) || attempt === maxAttempts) {
         throw err;
       }
@@ -223,7 +301,21 @@ async function withKeyRotationRetry<T>(
           : isRateLimitError(err)
             ? 250
             : 450 * attempt;
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
+      await new Promise<void>((resolve, reject) => {
+        if (externalSignal?.aborted) {
+          reject(new Error('ABORTED: Requisição cancelada pelo cliente.'));
+          return;
+        }
+        const timer = setTimeout(() => {
+          externalSignal?.removeEventListener('abort', onAbort);
+          resolve();
+        }, waitMs);
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(new Error('ABORTED: Requisição cancelada pelo cliente.'));
+        };
+        externalSignal?.addEventListener('abort', onAbort, {once: true});
+      });
     }
   }
   throw lastErr;
@@ -258,11 +350,13 @@ async function generateSantaText(params: {
   responseSchema?: unknown;
   maxAttempts?: number;
   timeoutMs?: number;
+  externalSignal?: AbortSignal;
 }) {
   const timeoutMs = params.timeoutMs ?? TEXT_GENERATION_TIMEOUT_MS;
   return withKeyRotationRetry(
     async (apiKey) => {
       const controller = new AbortController();
+      const unlinkAbort = linkAbortSignal(params.externalSignal, controller);
       const ai = createAiClient(apiKey, 'v1beta');
       const schemaConfig = params.responseSchema
         ? {
@@ -271,23 +365,28 @@ async function generateSantaText(params: {
           }
         : {};
 
-      return withTimeoutRace(
-        ai.models.generateContent({
-          model: GEMINI_TEXT_MODEL,
-          contents: params.contents,
-          config: {
-            abortSignal: controller.signal,
-            thinkingConfig: {thinkingBudget: 0},
-            ...schemaConfig,
-          },
-        }),
-        timeoutMs,
-        'generateSantaText',
-        () => controller.abort()
-      );
+      try {
+        return await withTimeoutRace(
+          ai.models.generateContent({
+            model: GEMINI_TEXT_MODEL,
+            contents: params.contents,
+            config: {
+              abortSignal: controller.signal,
+              thinkingConfig: {thinkingBudget: 0},
+              ...schemaConfig,
+            },
+          }),
+          timeoutMs,
+          'generateSantaText',
+          () => controller.abort()
+        );
+      } finally {
+        unlinkAbort();
+      }
     },
     params.maxAttempts ?? 2,
-    800
+    800,
+    params.externalSignal
   );
 }
 
@@ -408,7 +507,7 @@ function ensurePlayableAudio(
 }
 
 const SANTA_STYLE =
-  'Papai Noel brasileiro, idoso de ~70 anos, barítono profundo, quente e aveludado. Ritmo lento, sem pressa, sorriso audível, ternura de avô. Respiração calma.';
+  'Caloroso e acolhedor, ritmo lento e sem pressa, sorriso audível, ternura de avô, respiração calma.';
 
 async function synthesizeSantaVoiceViaRestV1Beta(params: {
   apiKey: string;
@@ -499,7 +598,8 @@ async function synthesizeSantaVoiceViaRestV1Beta(params: {
 async function synthesizeSantaVoice(
   text: string,
   requestedVoice?: string,
-  requestedModel?: string
+  requestedModel?: string,
+  externalSignal?: AbortSignal
 ): Promise<{
   audioBase64: string | null;
   audioMimeType: string | null;
@@ -517,6 +617,18 @@ async function synthesizeSantaVoice(
   const directedText = `<chuckle> ${spokenText}`;
 
   try {
+    if (externalSignal?.aborted) {
+      return {
+        audioBase64: null,
+        audioMimeType: null,
+        useBrowserFallback: true,
+        voiceUsed: voiceName,
+        modelUsed: ttsModel,
+        voiceSource: 'browser',
+        ttsError: 'ABORTED: Requisição cancelada pelo cliente.',
+      };
+    }
+
     if (getConfiguredApiKeys().length === 0) {
       console.warn('[Gemini TTS] GEMINI_API_KEY não configurada no servidor.');
       return {
@@ -538,7 +650,12 @@ async function synthesizeSantaVoice(
 
     const {rawData, rawMime, finishReason, partsCount} = await withKeyRotationRetry(
       async (apiKey) => {
+        if (externalSignal?.aborted) {
+          throw new Error('ABORTED: Requisição cancelada pelo cliente.');
+        }
+
         const controller = new AbortController();
+        const unlinkSdkAbort = linkAbortSignal(externalSignal, controller);
         const ai = createAiClient(apiKey, 'v1beta');
 
         try {
@@ -587,6 +704,10 @@ async function synthesizeSantaVoice(
             partsCount: respParts.length,
           };
         } catch (sdkErr) {
+          if (externalSignal?.aborted || isAbortError(sdkErr)) {
+            throw sdkErr;
+          }
+
           const sdkMsg = sdkErr instanceof Error ? sdkErr.message : String(sdkErr);
           const isSpeechMetaRejected =
             /speechMetadata|speech_metadata|Unknown name|Invalid JSON payload/i.test(sdkMsg);
@@ -600,6 +721,7 @@ async function synthesizeSantaVoice(
           );
 
           const restController = new AbortController();
+          const unlinkRestAbort = linkAbortSignal(externalSignal, restController);
           try {
             return await withTimeoutRace(
               synthesizeSantaVoiceViaRestV1Beta({
@@ -616,6 +738,10 @@ async function synthesizeSantaVoice(
               () => restController.abort()
             );
           } catch (restErr) {
+            if (externalSignal?.aborted || isAbortError(restErr)) {
+              throw restErr;
+            }
+
             const restMsg = restErr instanceof Error ? restErr.message : String(restErr);
             unsupportedFieldError = restMsg;
             console.error(
@@ -624,25 +750,35 @@ async function synthesizeSantaVoice(
 
             // Fallback final sem speech_metadata mantendo a tag <chuckle> no texto para não quebrar a chamada
             const plainController = new AbortController();
-            return await withTimeoutRace(
-              synthesizeSantaVoiceViaRestV1Beta({
-                apiKey,
-                ttsModel,
-                voiceName,
-                directedText,
-                style: SANTA_STYLE,
-                includeSpeechMetadata: false,
-                signal: plainController.signal,
-              }),
-              TTS_GENERATION_TIMEOUT_MS,
-              'synthesizeSantaVoiceRESTPlain',
-              () => plainController.abort()
-            );
+            const unlinkPlainAbort = linkAbortSignal(externalSignal, plainController);
+            try {
+              return await withTimeoutRace(
+                synthesizeSantaVoiceViaRestV1Beta({
+                  apiKey,
+                  ttsModel,
+                  voiceName,
+                  directedText,
+                  style: SANTA_STYLE,
+                  includeSpeechMetadata: false,
+                  signal: plainController.signal,
+                }),
+                TTS_GENERATION_TIMEOUT_MS,
+                'synthesizeSantaVoiceRESTPlain',
+                () => plainController.abort()
+              );
+            } finally {
+              unlinkPlainAbort();
+            }
+          } finally {
+            unlinkRestAbort();
           }
+        } finally {
+          unlinkSdkAbort();
         }
       },
       2,
-      1200
+      1200,
+      externalSignal
     );
 
     console.info('[Gemini TTS] Resposta recebida:', {
@@ -670,7 +806,11 @@ async function synthesizeSantaVoice(
     };
   } catch (err) {
     const message = extractReadableError(err);
-    console.error(`[Gemini TTS] Erro (${ttsModel} / ${voiceName}):`, message);
+    if (externalSignal?.aborted || isAbortError(err)) {
+      console.info(`[Gemini TTS] Síntese abortada após desconexão do cliente (${ttsModel}).`);
+    } else {
+      console.error(`[Gemini TTS] Erro (${ttsModel} / ${voiceName}):`, message);
+    }
     return {
       audioBase64: null,
       audioMimeType: null,
@@ -792,10 +932,224 @@ function resolvePublicBaseUrl(req: Request): string {
   return `${proto}://${host}`;
 }
 
+const MAX_CHILD_NAME_CHARS = 60;
+const MAX_PRAISE_CHARS = 120;
+const MAX_ADVICE_CHARS = 120;
+
+const INSULT_PHRASES = [
+  'filho da puta',
+  'filha da puta',
+  'vai se foder',
+  'vai tomar no cu',
+  'pau no cu',
+];
+
+const INSULT_WORDS = [
+  'porra',
+  'caralho',
+  'puta',
+  'puto',
+  'fdp',
+  'merda',
+  'bosta',
+  'desgraca',
+  'arrombado',
+  'arrombada',
+  'viado',
+  'bicha',
+  'corno',
+  'vagabundo',
+  'vagabunda',
+  'otario',
+  'otaria',
+  'idiota',
+  'imbecil',
+  'retardado',
+  'retardada',
+  'cuzao',
+  'cuzona',
+  'buceta',
+  'xoxota',
+  'piroca',
+  'fodase',
+  'foder',
+  'escroto',
+  'escrota',
+  'babaca',
+  'cretino',
+  'cretina',
+  'fuck',
+  'fucking',
+  'shit',
+  'bitch',
+  'asshole',
+  'bastard',
+  'cunt',
+  'slut',
+  'whore',
+];
+
+function escapeRegexLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+const INSULT_REGEXES = [
+  ...INSULT_PHRASES.map(
+    (phrase) => new RegExp(`(?:^|[^a-z0-9])${escapeRegexLiteral(phrase)}(?=$|[^a-z0-9])`, 'i')
+  ),
+  ...INSULT_WORDS.map(
+    (word) => new RegExp(`(?:^|[^a-z0-9])${escapeRegexLiteral(word)}(?=$|[^a-z0-9])`, 'i')
+  ),
+];
+
+const INSTRUCTION_PATTERNS: RegExp[] = [
+  /\b(?:ignore|disregard|forget|override|bypass)\b[\s\S]{0,40}\b(?:instructions?|prompts?|rules?|system|previous|above|prior)\b/i,
+  /\b(?:ignore|esqueca|desconsidere|anule)\b[\s\S]{0,40}\b(?:instrucoes|regras|comandos?|sistema|anteriores)\b/i,
+  /\b(?:atue|aja|finja|fale)\s+como\b/i,
+  /\b(?:you\s+are\s+now|act\s+as|pretend\s+to\s+be|system\s+prompt|developer\s+message|jailbreak|dan\s+mode)\b/i,
+  /\b(?:diga\s+o\s+seguinte|responda\s+apenas|repita\s+exatamente|novas?\s+instrucoes|novo\s+comando)\s*:/i,
+  /<\s*\/?\s*(?:system|prompt|assistant|user|instruction|chuckle|laugh|breath|short\s+pause)\b[^>]*>/i,
+  /(?:^|\n)\s*(?:###\s*(?:system|prompt|instruction)|\[(?:system|inst)\]|(?:system|assistant|developer|prompt)\s*:)/i,
+];
+
+function normalizeForSafetyCheck(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase();
+}
+
+function validateParentField(
+  rawValue: unknown,
+  fieldLabel: string,
+  maxLength: number,
+  required = false
+): {ok: true; value: string} | {ok: false; error: string} {
+  if (rawValue !== undefined && rawValue !== null && typeof rawValue !== 'string') {
+    return {ok: false, error: `Campo "${fieldLabel}" inválido.`};
+  }
+  const trimmed = typeof rawValue === 'string' ? rawValue.trim() : '';
+  if (required && !trimmed) {
+    return {ok: false, error: `Informe ${fieldLabel}.`};
+  }
+  if (!trimmed) {
+    return {ok: true, value: ''};
+  }
+  if (trimmed.length > maxLength) {
+    return {
+      ok: false,
+      error: `${fieldLabel} deve ter no máximo ${maxLength} caracteres.`,
+    };
+  }
+
+  const normalized = normalizeForSafetyCheck(trimmed);
+  if (INSULT_REGEXES.some((rx) => rx.test(normalized))) {
+    return {
+      ok: false,
+      error: `${fieldLabel} contém termos inadequados para a chamada infantil.`,
+    };
+  }
+  if (
+    INSTRUCTION_PATTERNS.some((rx) => rx.test(trimmed)) ||
+    INSTRUCTION_PATTERNS.some((rx) => rx.test(normalized))
+  ) {
+    return {
+      ok: false,
+      error: `${fieldLabel} contém texto inválido com padrão de instrução.`,
+    };
+  }
+  return {ok: true, value: trimmed};
+}
+
+function validateParentFields(
+  fields: {childName?: unknown; praise?: unknown; advice?: unknown},
+  options: {requireChildName?: boolean} = {}
+):
+  | {ok: true; childName: string; praise: string; advice: string}
+  | {ok: false; error: string} {
+  const nameRes = validateParentField(
+    fields.childName,
+    'Nome da criança',
+    MAX_CHILD_NAME_CHARS,
+    Boolean(options.requireChildName)
+  );
+  if (!nameRes.ok) return nameRes;
+
+  const praiseRes = validateParentField(fields.praise, 'Elogio', MAX_PRAISE_CHARS, false);
+  if (!praiseRes.ok) return praiseRes;
+
+  const adviceRes = validateParentField(fields.advice, 'Conselho', MAX_ADVICE_CHARS, false);
+  if (!adviceRes.ok) return adviceRes;
+
+  return {
+    ok: true,
+    childName: nameRes.value || 'pequeno amigo',
+    praise: praiseRes.value,
+    advice: adviceRes.value,
+  };
+}
+
+const REPLY_RATE_LIMIT_WINDOW_MS = 60_000;
+const REPLY_RATE_LIMIT_MAX = 6;
+const replyIpHits = new Map<string, number[]>();
+
+function checkReplyRateLimit(req: Request, res: Response, next: () => void): void {
+  const ip = (req.ip || req.socket.remoteAddress || 'unknown').trim();
+  const now = Date.now();
+  const cutoff = now - REPLY_RATE_LIMIT_WINDOW_MS;
+
+  if (replyIpHits.size > 500) {
+    for (const [key, timestamps] of replyIpHits.entries()) {
+      const fresh = timestamps.filter((t) => t > cutoff);
+      if (fresh.length === 0) {
+        replyIpHits.delete(key);
+      } else {
+        replyIpHits.set(key, fresh);
+      }
+    }
+  }
+
+  const recent = (replyIpHits.get(ip) || []).filter((t) => t > cutoff);
+  if (recent.length >= REPLY_RATE_LIMIT_MAX) {
+    const oldest = recent[0];
+    const retryAfterSec = Math.max(1, Math.ceil((oldest + REPLY_RATE_LIMIT_WINDOW_MS - now) / 1000));
+    res.setHeader('Retry-After', String(retryAfterSec));
+    res.status(429).json({
+      error: 'Muitas mensagens seguidas. Aguarde alguns segundos antes de falar novamente.',
+    });
+    return;
+  }
+
+  recent.push(now);
+  replyIpHits.set(ip, recent);
+  next();
+}
+
 async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
-  app.use(express.json({limit: '15mb'}));
+
+  // Limite estrito de 2MB em /api/santa/reply; demais rotas mantêm parsing JSON padrão
+  app.use('/api/santa/reply', express.json({limit: '2mb'}));
+  app.use((req: Request, res: Response, next) => {
+    if (req.path === '/api/santa/reply') {
+      next();
+      return;
+    }
+    express.json({limit: '15mb'})(req, res, next);
+  });
+
+  app.use((err: unknown, _req: Request, res: Response, next: (e?: unknown) => void) => {
+    const bodyErr = err as {type?: string; status?: number; statusCode?: number; message?: string};
+    if (
+      bodyErr &&
+      (bodyErr.type === 'entity.too.large' || bodyErr.status === 413 || bodyErr.statusCode === 413)
+    ) {
+      res.status(413).json({error: 'Tamanho do áudio ou payload excede o limite de 2MB.'});
+      return;
+    }
+    next(err);
+  });
 
   app.get('/robots.txt', (req: Request, res: Response) => {
     const baseUrl = resolvePublicBaseUrl(req);
@@ -939,11 +1293,22 @@ async function startServer() {
         voice?: string;
         model?: string;
       };
-      const childName = (body.name || 'Vinicius').trim() || 'Vinicius';
-      const childPraise = prepareSantaSpeechScript(body.praise || '', 90).replace(/[.!?…]+$/g, '');
-      const childAdvice = prepareSantaSpeechScript(body.advice || '', 90).replace(/[.!?…]+$/g, '');
+      const validation = validateParentFields({
+        childName: body.name ?? 'Vinicius',
+        praise: body.praise,
+        advice: body.advice,
+      });
+      if (!validation.ok) {
+        res.status(400).json({error: validation.error});
+        return;
+      }
+
+      const childName = validation.childName || 'Vinicius';
+      const childPraise = prepareSantaSpeechScript(validation.praise, 90).replace(/[.!?…]+$/g, '');
+      const childAdvice = prepareSantaSpeechScript(validation.advice, 90).replace(/[.!?…]+$/g, '');
       const voiceName = resolveSantaTtsVoice(body.voice);
       const ttsModel = resolveSantaTtsModel(body.model);
+      const cacheKey = `debug:${childName.toLowerCase()}:${voiceName}:${ttsModel}`;
 
       let rawTestText = `Olá, ${childName}! Que alegria ver você...`;
       if (childPraise) {
@@ -954,7 +1319,46 @@ async function startServer() {
       }
       const testText = prepareSantaSpeechScript(rawTestText, 180);
 
+      const diskHit = !childPraise && !childAdvice ? lookupDiskAudioBank(childName) : null;
+      if (diskHit) {
+        res.json({
+          success: true,
+          text: testText,
+          audioBase64: diskHit.audioBase64,
+          audioMimeType: diskHit.audioMimeType,
+          mimeType: diskHit.audioMimeType,
+          voice: voiceName,
+          voiceSource: 'audio-bank',
+          model: ttsModel,
+          useBrowserFallback: false,
+        });
+        return;
+      }
+
+      if (audioBank.has(cacheKey)) {
+        const cached = audioBank.get(cacheKey)!;
+        res.json({
+          success: true,
+          text: cached.text || testText,
+          audioBase64: cached.audioBase64,
+          audioMimeType: cached.audioMimeType,
+          mimeType: cached.audioMimeType,
+          voice: voiceName,
+          voiceSource: 'audio-bank',
+          model: ttsModel,
+          useBrowserFallback: false,
+        });
+        return;
+      }
+
       const synth = await synthesizeSantaVoice(testText, voiceName, ttsModel);
+      if (synth.audioBase64 && synth.audioMimeType) {
+        setLimitedCache(audioBank, cacheKey, {
+          audioBase64: synth.audioBase64,
+          audioMimeType: synth.audioMimeType,
+          text: testText,
+        });
+      }
 
       res.json({
         success: Boolean(synth.audioBase64),
@@ -977,12 +1381,25 @@ async function startServer() {
   });
 
   app.post('/api/santa/greeting', async (req: Request, res: Response) => {
+    const {controller: routeAbortController, cleanup: cleanupDisconnectListeners} =
+      createRequestAbortController(req, res);
+
     try {
-      const body = req.body as GreetingBody;
-      const childName = (body.childName || 'pequeno amigo').trim();
-      const childAge = (body.childAge || '').trim();
-      const praise = (body.praise || '').trim();
-      const advice = (body.advice || '').trim();
+      const body = (req.body || {}) as GreetingBody;
+      const validation = validateParentFields({
+        childName: body.childName,
+        praise: body.praise,
+        advice: body.advice,
+      });
+      if (!validation.ok) {
+        res.status(400).json({error: validation.error});
+        return;
+      }
+
+      const childName = validation.childName;
+      const childAge = typeof body.childAge === 'string' ? body.childAge.trim().slice(0, 12) : '';
+      const praise = validation.praise;
+      const advice = validation.advice;
       const planId: PlanId = body.planId || '30s';
       const farewellType = normalizeFarewellType(body.farewellType);
 
@@ -1030,9 +1447,10 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
       let farewellText = getFarewellScript(farewellType, childName);
 
       try {
-        if (getConfiguredApiKeys().length > 0) {
+        if (getConfiguredApiKeys().length > 0 && !routeAbortController.signal.aborted) {
           const textResult = await generateSantaText({
             contents: prompt,
+            externalSignal: routeAbortController.signal,
             responseSchema: {
               type: Type.OBJECT,
               properties: {
@@ -1055,40 +1473,58 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
           }
         }
       } catch (err) {
+        if (routeAbortController.signal.aborted || isAbortError(err)) {
+          return;
+        }
         console.warn('Greeting text fallback used:', extractReadableError(err));
       }
 
-      // Check composite Audio Bank cache (${planId}:${childName.toLowerCase()}:${childAge}:${praise}:${advice})
-      // Only use static disk name-only clip if no custom praise/advice was entered.
-      const diskBankHit = !praise && !advice ? lookupDiskAudioBank(childName) : null;
-      let greetingAudio: {
+      if (routeAbortController.signal.aborted || res.writableEnded) {
+        return;
+      }
+
+      const resolveGreetingAudio = async (): Promise<{
         audioBase64: string | null;
         audioMimeType: string | null;
         useBrowserFallback: boolean;
         voiceSource: string;
         ttsError?: string;
         unsupportedFieldError?: string;
-      };
-
-      if (diskBankHit) {
-        greetingAudio = {
-          audioBase64: diskBankHit.audioBase64,
-          audioMimeType: diskBankHit.audioMimeType,
-          useBrowserFallback: false,
-          voiceSource: 'audio-bank',
-        };
-      } else if (audioBank.has(audioBankKey)) {
-        const cachedBank = audioBank.get(audioBankKey)!;
-        greetingAudio = {
-          audioBase64: cachedBank.audioBase64,
-          audioMimeType: cachedBank.audioMimeType,
-          useBrowserFallback: false,
-          voiceSource: 'gemini-tts',
-        };
-        greetingText = cachedBank.text;
-      } else {
-        const genRes = await synthesizeSantaVoice(greetingText);
-        greetingAudio = {
+        resolvedText?: string;
+      }> => {
+        const diskBankHit = !praise && !advice ? lookupDiskAudioBank(childName) : null;
+        if (diskBankHit) {
+          return {
+            audioBase64: diskBankHit.audioBase64,
+            audioMimeType: diskBankHit.audioMimeType,
+            useBrowserFallback: false,
+            voiceSource: 'audio-bank',
+          };
+        }
+        if (audioBank.has(audioBankKey)) {
+          const cachedBank = audioBank.get(audioBankKey)!;
+          return {
+            audioBase64: cachedBank.audioBase64,
+            audioMimeType: cachedBank.audioMimeType,
+            useBrowserFallback: false,
+            voiceSource: 'gemini-tts',
+            resolvedText: cachedBank.text,
+          };
+        }
+        const genRes = await synthesizeSantaVoice(
+          greetingText,
+          undefined,
+          undefined,
+          routeAbortController.signal
+        );
+        if (genRes.audioBase64 && genRes.audioMimeType && !routeAbortController.signal.aborted) {
+          setLimitedCache(audioBank, audioBankKey, {
+            audioBase64: genRes.audioBase64,
+            audioMimeType: genRes.audioMimeType,
+            text: greetingText,
+          });
+        }
+        return {
           audioBase64: genRes.audioBase64,
           audioMimeType: genRes.audioMimeType,
           useBrowserFallback: genRes.useBrowserFallback,
@@ -1096,25 +1532,21 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
           ttsError: genRes.ttsError,
           unsupportedFieldError: genRes.unsupportedFieldError,
         };
-        if (genRes.audioBase64 && genRes.audioMimeType) {
-          setLimitedCache(audioBank, audioBankKey, {
-            audioBase64: genRes.audioBase64,
-            audioMimeType: genRes.audioMimeType,
-            text: greetingText,
-          });
-        }
-      }
+      };
 
-      // Pre-synthesize farewell audio using existing farewellCache so T-6s/T-3s plays with 0ms network wait
       const farewellCacheKey = `${farewellType}|${childName.toLowerCase()}|${farewellText}`;
-      const cachedFarewell = farewellCache.get(farewellCacheKey);
-      let farewellAudioPayload: CachedFarewell;
-
-      if (cachedFarewell && cachedFarewell.farewellAudioBase64) {
-        farewellAudioPayload = cachedFarewell;
-      } else {
-        const synthFarewell = await synthesizeSantaVoice(farewellText);
-        farewellAudioPayload = {
+      const resolveFarewellAudio = async (): Promise<CachedFarewell> => {
+        const cachedFarewell = farewellCache.get(farewellCacheKey);
+        if (cachedFarewell && cachedFarewell.farewellAudioBase64) {
+          return cachedFarewell;
+        }
+        const synthFarewell = await synthesizeSantaVoice(
+          farewellText,
+          undefined,
+          undefined,
+          routeAbortController.signal
+        );
+        const result: CachedFarewell = {
           farewellText,
           farewellAudioBase64: synthFarewell.audioBase64,
           farewellAudioMimeType: synthFarewell.audioMimeType,
@@ -1122,9 +1554,23 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
           voiceSource: synthFarewell.voiceSource,
           ttsError: synthFarewell.ttsError || null,
         };
-        if (farewellAudioPayload.farewellAudioBase64) {
-          setLimitedCache(farewellCache, farewellCacheKey, farewellAudioPayload);
+        if (result.farewellAudioBase64 && !routeAbortController.signal.aborted) {
+          setLimitedCache(farewellCache, farewellCacheKey, result);
         }
+        return result;
+      };
+
+      const [greetingAudio, farewellAudioPayload] = await Promise.all([
+        resolveGreetingAudio(),
+        resolveFarewellAudio(),
+      ]);
+
+      if (routeAbortController.signal.aborted || res.writableEnded) {
+        return;
+      }
+
+      if (greetingAudio.resolvedText) {
+        greetingText = greetingAudio.resolvedText;
       }
 
       const payload: CachedGreeting = {
@@ -1150,19 +1596,31 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
 
       res.json(payload);
     } catch (error) {
+      if (routeAbortController.signal.aborted || isAbortError(error) || res.writableEnded) {
+        return;
+      }
       const message = extractReadableError(error);
       console.error('/api/santa/greeting error:', message);
       res.status(500).json({error: message});
+    } finally {
+      cleanupDisconnectListeners();
     }
   });
 
   app.post('/api/santa/farewell', async (req: Request, res: Response) => {
     try {
-      const body = req.body as FarewellBody;
-      const childName = (body.childName || 'pequeno amigo').trim();
+      const body = (req.body || {}) as FarewellBody;
+      const validation = validateParentFields({childName: body.childName});
+      if (!validation.ok) {
+        res.status(400).json({error: validation.error});
+        return;
+      }
+
+      const childName = validation.childName;
       const farewellType = normalizeFarewellType(body.farewellType);
       const rawFarewell =
-        (body.farewellText || '').trim() || getFarewellScript(farewellType, childName);
+        (typeof body.farewellText === 'string' ? body.farewellText.trim() : '') ||
+        getFarewellScript(farewellType, childName);
       const farewellText = sanitizeTextForSantaTts(rawFarewell) || getFarewellScript(farewellType, childName);
 
       const cacheKey = `${farewellType}|${childName.toLowerCase()}|${farewellText}`;
@@ -1194,7 +1652,7 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
       const body = (req.body || {}) as FarewellBody;
       const fallbackText = getFarewellScript(
         normalizeFarewellType(body.farewellType),
-        (body.childName || 'pequeno amigo').trim()
+        (typeof body.childName === 'string' ? body.childName.trim() : '') || 'pequeno amigo'
       );
       res.json({
         farewellText: fallbackText,
@@ -1208,12 +1666,25 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
   });
 
   // Zero-latency streaming reply endpoint using chunked transfer encoding (NDJSON stream chunks)
-  app.post('/api/santa/reply', async (req: Request, res: Response) => {
+  app.post('/api/santa/reply', checkReplyRateLimit, async (req: Request, res: Response) => {
     const body = (req.body || {}) as ReplyBody;
-    const childName = (body.childName || 'pequeno amigo').trim();
-    const childAge = (body.childAge || '').trim();
-    const praise = (body.praise || '').trim();
-    const advice = (body.advice || '').trim();
+    const validation = validateParentFields({
+      childName: body.childName,
+      praise: body.praise,
+      advice: body.advice,
+    });
+    if (!validation.ok) {
+      res.status(400).json({error: validation.error});
+      return;
+    }
+
+    const {controller: routeAbortController, cleanup: cleanupDisconnectListeners} =
+      createRequestAbortController(req, res);
+
+    const childName = validation.childName;
+    const childAge = typeof body.childAge === 'string' ? body.childAge.trim().slice(0, 12) : '';
+    const praise = validation.praise;
+    const advice = validation.advice;
     const history = Array.isArray(body.history) ? body.history : [];
     const safeTimeoutReply =
       'O sinal no Polo Norte deu uma piscadinha... pode repetir para o Papai Noel?';
@@ -1223,7 +1694,7 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
     res.setHeader('Cache-Control', 'no-cache');
 
     const sendChunkObj = (obj: unknown) => {
-      if (!res.writableEnded) {
+      if (!res.writableEnded && !routeAbortController.signal.aborted) {
         res.write(JSON.stringify(obj) + '\n');
       }
     };
@@ -1232,25 +1703,33 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
     try {
       timeoutId = setTimeout(() => {
         console.warn('/api/santa/reply hit 14s safety timeout in stream');
-        sendChunkObj({
-          transcript: (body.childText || '').trim(),
-          replyText: safeTimeoutReply,
-          audioBase64: null,
-          audioMimeType: null,
-          useBrowserFallback: true,
-          voiceSource: 'browser',
-          done: true,
-        });
-        if (!res.writableEnded) res.end();
+        routeAbortController.abort();
+        if (!res.writableEnded) {
+          res.write(
+            JSON.stringify({
+              transcript: (typeof body.childText === 'string' ? body.childText : '').trim(),
+              replyText: safeTimeoutReply,
+              audioBase64: null,
+              audioMimeType: null,
+              useBrowserFallback: true,
+              voiceSource: 'browser',
+              done: true,
+            }) + '\n'
+          );
+          res.end();
+        }
       }, 14000);
 
-      let transcript = (body.childText || '').trim();
-      if (!transcript && body.audioBase64) {
+      let transcript = (typeof body.childText === 'string' ? body.childText : '').trim().slice(0, 240);
+      if (!transcript && typeof body.audioBase64 === 'string' && body.audioBase64) {
         try {
-          const rawMime = (body.audioMimeType || 'audio/mp4').split(';')[0].trim();
+          const rawMime = (typeof body.audioMimeType === 'string' ? body.audioMimeType : 'audio/mp4')
+            .split(';')[0]
+            .trim();
           const transcribeResult = await withKeyRotationRetry(
-            (apiKey) => {
+            async (apiKey) => {
               const controller = new AbortController();
+              const unlinkAbort = linkAbortSignal(routeAbortController.signal, controller);
               const ai = createAiClient(apiKey, 'v1beta');
               const audioParts = [
                 {
@@ -1264,27 +1743,39 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
                 },
               ];
 
-              return withTimeoutRace(
-                ai.models.generateContent({
-                  model: GEMINI_TEXT_MODEL,
-                  contents: {parts: audioParts},
-                  config: {
-                    abortSignal: controller.signal,
-                    thinkingConfig: {thinkingBudget: 0},
-                  },
-                }),
-                TRANSCRIPTION_TIMEOUT_MS,
-                'transcribeChildAudio',
-                () => controller.abort()
-              );
+              try {
+                return await withTimeoutRace(
+                  ai.models.generateContent({
+                    model: GEMINI_TEXT_MODEL,
+                    contents: {parts: audioParts},
+                    config: {
+                      abortSignal: controller.signal,
+                      thinkingConfig: {thinkingBudget: 0},
+                    },
+                  }),
+                  TRANSCRIPTION_TIMEOUT_MS,
+                  'transcribeChildAudio',
+                  () => controller.abort()
+                );
+              } finally {
+                unlinkAbort();
+              }
             },
             1,
-            300
+            300,
+            routeAbortController.signal
           );
-          transcript = transcribeResult.text?.trim() || '';
+          transcript = transcribeResult.text?.trim().slice(0, 240) || '';
         } catch (err) {
+          if (routeAbortController.signal.aborted || isAbortError(err)) {
+            return;
+          }
           console.warn('Transcription error:', extractReadableError(err));
         }
+      }
+
+      if (routeAbortController.signal.aborted || res.writableEnded) {
+        return;
       }
 
       const effectiveTranscript = transcript || 'Oi Papai Noel!';
@@ -1312,12 +1803,20 @@ REGRAS OBRIGATÓRIAS:
           contents: replyPrompt,
           maxAttempts: 1,
           timeoutMs: 2600,
+          externalSignal: routeAbortController.signal,
         });
         if (replyResult && replyResult.text?.trim()) {
           replyText = prepareSantaSpeechScript(replyResult.text, 160) || replyText;
         }
       } catch (err) {
+        if (routeAbortController.signal.aborted || isAbortError(err)) {
+          return;
+        }
         console.warn('Reply text fallback used:', extractReadableError(err));
+      }
+
+      if (routeAbortController.signal.aborted || res.writableEnded) {
+        return;
       }
 
       // Stream initial text metadata chunk immediately before audio synthesis finishes
@@ -1328,8 +1827,17 @@ REGRAS OBRIGATÓRIAS:
         done: false,
       });
 
-      // Generate natural Santa voice via Gemini TTS
-      const audio = await synthesizeSantaVoice(replyText);
+      // Generate natural Santa voice via Gemini Flash Lite TTS (bucket separado e menor latência)
+      const audio = await synthesizeSantaVoice(
+        replyText,
+        undefined,
+        'gemini-3.8-flash-lite-tts',
+        routeAbortController.signal
+      );
+
+      if (routeAbortController.signal.aborted || res.writableEnded) {
+        return;
+      }
 
       if (timeoutId) clearTimeout(timeoutId);
 
@@ -1346,10 +1854,13 @@ REGRAS OBRIGATÓRIAS:
       if (!res.writableEnded) res.end();
     } catch (error) {
       if (timeoutId) clearTimeout(timeoutId);
+      if (routeAbortController.signal.aborted || isAbortError(error) || res.writableEnded) {
+        return;
+      }
       const message = extractReadableError(error);
       console.error('/api/santa/reply stream error:', message);
       sendChunkObj({
-        transcript: (body.childText || '').trim(),
+        transcript: (typeof body.childText === 'string' ? body.childText : '').trim(),
         replyText: safeTimeoutReply,
         audioBase64: null,
         audioMimeType: null,
@@ -1357,14 +1868,29 @@ REGRAS OBRIGATÓRIAS:
         error: message,
       });
       if (!res.writableEnded) res.end();
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId);
+      cleanupDisconnectListeners();
     }
   });
 
   app.post('/api/parent/magic-link', async (req: Request, res: Response) => {
     try {
       const {email, config} = req.body as {email?: string; config?: GreetingBody};
-      if (!config || !config.childName?.trim()) {
-        res.status(400).json({error: 'Informe o nome da criança para gerar o link mágico.'});
+      if (!config) {
+        res.status(400).json({error: 'Informe os dados da chamada para gerar o link mágico.'});
+        return;
+      }
+      const validation = validateParentFields(
+        {
+          childName: config.childName,
+          praise: config.praise,
+          advice: config.advice,
+        },
+        {requireChildName: true}
+      );
+      if (!validation.ok) {
+        res.status(400).json({error: validation.error});
         return;
       }
       const payload = Buffer.from(JSON.stringify(config), 'utf8').toString('base64url');

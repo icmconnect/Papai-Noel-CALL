@@ -18,6 +18,16 @@ const SPEECH_EMA_CURR_WEIGHT = 0.3;
 const SPEECH_ENTER_TALKING_THRESHOLD = 0.08;
 const SPEECH_EXIT_LISTENING_THRESHOLD = 0.03;
 const SPEECH_HOLD_MS = 400;
+const MIC_HOLD_MAX_MS = 10000;
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return window.btoa(binary);
+}
 
 interface VideoCallScreenProps {
   config: CallConfig;
@@ -85,11 +95,6 @@ function formatTimer(seconds: number): string {
   return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
 }
 
-function getFallbackGreeting(childName: string): string {
-  const name = childName.trim() || 'meu bem';
-  return `Olá, ${name}... que alegria falar com você direto do Polo Norte!`;
-}
-
 function getFallbackFarewell(farewellType: CallConfig['farewellType'], childName: string): string {
   const name = childName.trim() || 'meu bem';
   switch (farewellType) {
@@ -124,6 +129,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   const [isSpeechListening, setIsSpeechListening] = useState(false);
   const [isHoldingMic, setIsHoldingMic] = useState(false);
   const [isSendingReply, setIsSendingReply] = useState(false);
+  const [isConnectingNorthPole, setIsConnectingNorthPole] = useState(false);
 
   const childCamRef = useRef<HTMLVideoElement | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
@@ -132,6 +138,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   const holdTranscriptRef = useRef<string>('');
   const holdFlushedRef = useRef<boolean>(false);
   const holdStopTimeoutRef = useRef<number | null>(null);
+  const holdMaxDurationTimeoutRef = useRef<number | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const recordedChunksRef = useRef<Blob[]>([]);
@@ -147,11 +154,13 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   const safetyEndTimeoutRef = useRef<number | null>(null);
   const helloTimeoutRef = useRef<number | null>(null);
   const greetingFallbackTimeoutRef = useRef<number | null>(null);
+  const genericGreetingAbortRef = useRef<AbortController | null>(null);
   const speechRestartTimeoutRef = useRef<number | null>(null);
   const replyAbortTimeoutRef = useRef<number | null>(null);
   const replyAbortControllerRef = useRef<AbortController | null>(null);
   const farewellAbortTimeoutRef = useRef<number | null>(null);
   const farewellAbortControllerRef = useRef<AbortController | null>(null);
+  const stopHoldRecordingRef = useRef<() => void>(() => undefined);
 
   const isAudioPlayingRef = useRef(false);
   const speechEmaRef = useRef(0);
@@ -203,6 +212,10 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       window.clearTimeout(holdStopTimeoutRef.current);
       holdStopTimeoutRef.current = null;
     }
+    if (holdMaxDurationTimeoutRef.current !== null) {
+      window.clearTimeout(holdMaxDurationTimeoutRef.current);
+      holdMaxDurationTimeoutRef.current = null;
+    }
     recognitionModeRef.current = null;
     if (recognitionRef.current) {
       try {
@@ -221,6 +234,10 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   }, []);
 
   const stopMediaRecorderIfActive = useCallback((discard: boolean) => {
+    if (holdMaxDurationTimeoutRef.current !== null) {
+      window.clearTimeout(holdMaxDurationTimeoutRef.current);
+      holdMaxDurationTimeoutRef.current = null;
+    }
     discardRecordingRef.current = discard;
     isHoldingMicRef.current = false;
     pendingMicReleaseRef.current = false;
@@ -253,6 +270,14 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       window.clearTimeout(greetingFallbackTimeoutRef.current);
       greetingFallbackTimeoutRef.current = null;
     }
+    if (genericGreetingAbortRef.current) {
+      try {
+        genericGreetingAbortRef.current.abort();
+      } catch {
+        // Ignore
+      }
+      genericGreetingAbortRef.current = null;
+    }
     if (speechRestartTimeoutRef.current !== null) {
       window.clearTimeout(speechRestartTimeoutRef.current);
       speechRestartTimeoutRef.current = null;
@@ -260,6 +285,10 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     if (holdStopTimeoutRef.current !== null) {
       window.clearTimeout(holdStopTimeoutRef.current);
       holdStopTimeoutRef.current = null;
+    }
+    if (holdMaxDurationTimeoutRef.current !== null) {
+      window.clearTimeout(holdMaxDurationTimeoutRef.current);
+      holdMaxDurationTimeoutRef.current = null;
     }
     if (replyAbortTimeoutRef.current !== null) {
       window.clearTimeout(replyAbortTimeoutRef.current);
@@ -896,6 +925,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       timeLeftRef.current = plan.durationSeconds;
       callPhaseRef.current = 'waiting-greeting';
       setCallPhase('waiting-greeting');
+      setIsConnectingNorthPole(false);
       setTimeLeft(plan.durationSeconds);
       setVideoState('hello');
       return;
@@ -910,6 +940,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     timeLeftRef.current = plan.durationSeconds;
     callPhaseRef.current = 'waiting-greeting';
     setCallPhase('waiting-greeting');
+    setIsConnectingNorthPole(false);
     setTimeLeft(plan.durationSeconds);
     setVideoState('hello');
 
@@ -923,44 +954,88 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       }
     }
 
-    // Proteção caso preparedMedia atrase ou falhe no carregamento inicial
+    // Proteção após 4000ms se preparedMedia ainda estiver carregando: tenta /audio/bank/ola_generico.mp3;
+    // se não existir, mantém silêncio com badge "Conectando ao Polo Norte..." até o áudio real chegar (nunca speechSynthesis)
     greetingFallbackTimeoutRef.current = window.setTimeout(() => {
       greetingFallbackTimeoutRef.current = null;
       if (!mountedRef.current || greetingStartedRef.current || farewellTriggeredRef.current) {
         return;
       }
-      greetingStartedRef.current = true;
-      const fallbackText = getFallbackGreeting(config.childName);
-      historyRef.current = [{role: 'santa', text: fallbackText}];
 
-      void playSantaAudio({
-        audioBase64: null,
-        audioMimeType: null,
-        fallbackText,
-        useBrowserFallback: true,
-        onStart: () => {
-          isAudioPlayingRef.current = true;
-          lastAboveThresholdAtRef.current = performance.now();
-          isGateTalkingRef.current = true;
-          beginCallTimeline();
-        },
-        onAudioVolume: syncConversationVideoByVolume,
-        onEnd: () => {
-          isAudioPlayingRef.current = false;
-          resetSpeechGate();
-          if (
-            !farewellTriggeredRef.current &&
-            callPhaseRef.current !== 'farewell' &&
-            callPhaseRef.current !== 'ending' &&
-            mountedRef.current
-          ) {
-            if (callPhaseRef.current === 'conversation') {
-              setVideoState('listening');
-            }
-            scheduleAutoSpeechListening();
+      const abortController = new AbortController();
+      genericGreetingAbortRef.current = abortController;
+
+      void (async () => {
+        try {
+          const res = await fetch('/audio/bank/ola_generico.mp3', {
+            signal: abortController.signal,
+          });
+          const contentType = (res.headers.get('content-type') || '').toLowerCase();
+          if (!res.ok || contentType.includes('text/html')) {
+            throw new Error('Áudio estático genérico indisponível.');
           }
-        },
-      });
+          const buf = await res.arrayBuffer();
+          if (buf.byteLength < 500) {
+            throw new Error('Áudio estático genérico vazio.');
+          }
+
+          if (
+            !mountedRef.current ||
+            greetingStartedRef.current ||
+            farewellTriggeredRef.current ||
+            preparedMediaRef.current
+          ) {
+            return;
+          }
+
+          greetingStartedRef.current = true;
+          setIsConnectingNorthPole(false);
+          historyRef.current = [{role: 'santa', text: 'Olá! Que alegria falar com você!'}];
+
+          await playSantaAudio({
+            audioBase64: arrayBufferToBase64(buf),
+            audioMimeType: 'audio/mpeg',
+            fallbackText: '',
+            useBrowserFallback: false,
+            disableBrowserFallback: true,
+            onStart: () => {
+              isAudioPlayingRef.current = true;
+              lastAboveThresholdAtRef.current = performance.now();
+              isGateTalkingRef.current = true;
+              beginCallTimeline();
+            },
+            onAudioVolume: syncConversationVideoByVolume,
+            onEnd: () => {
+              isAudioPlayingRef.current = false;
+              resetSpeechGate();
+              if (
+                !farewellTriggeredRef.current &&
+                callPhaseRef.current !== 'farewell' &&
+                callPhaseRef.current !== 'ending' &&
+                mountedRef.current
+              ) {
+                if (callPhaseRef.current === 'conversation') {
+                  setVideoState('listening');
+                }
+                scheduleAutoSpeechListening();
+              }
+            },
+          });
+        } catch {
+          if (
+            mountedRef.current &&
+            !greetingStartedRef.current &&
+            !farewellTriggeredRef.current &&
+            !preparedMediaRef.current
+          ) {
+            setIsConnectingNorthPole(true);
+          }
+        } finally {
+          if (genericGreetingAbortRef.current === abortController) {
+            genericGreetingAbortRef.current = null;
+          }
+        }
+      })();
     }, 4000);
 
     return () => {
@@ -969,7 +1044,6 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   }, [
     beginCallTimeline,
     cleanupAllDevices,
-    config.childName,
     isCallActive,
     plan.durationSeconds,
     resetSpeechGate,
@@ -988,7 +1062,16 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       window.clearTimeout(greetingFallbackTimeoutRef.current);
       greetingFallbackTimeoutRef.current = null;
     }
+    if (genericGreetingAbortRef.current) {
+      try {
+        genericGreetingAbortRef.current.abort();
+      } catch {
+        // Ignore
+      }
+      genericGreetingAbortRef.current = null;
+    }
 
+    setIsConnectingNorthPole(false);
     greetingStartedRef.current = true;
     historyRef.current = [{role: 'santa', text: preparedMedia.greetingText}];
 
@@ -1166,6 +1249,17 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     pendingMicReleaseRef.current = false;
     setIsHoldingMic(true);
 
+    // Teto de 10s no hold do mic com auto-envio (stopHoldRecording automático)
+    if (holdMaxDurationTimeoutRef.current !== null) {
+      window.clearTimeout(holdMaxDurationTimeoutRef.current);
+    }
+    holdMaxDurationTimeoutRef.current = window.setTimeout(() => {
+      holdMaxDurationTimeoutRef.current = null;
+      if (isHoldingMicRef.current && mountedRef.current) {
+        stopHoldRecordingRef.current();
+      }
+    }, MIC_HOLD_MAX_MS);
+
     if (helloTimeoutRef.current !== null) {
       window.clearTimeout(helloTimeoutRef.current);
       helloTimeoutRef.current = null;
@@ -1235,7 +1329,12 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     await startMediaRecorderHoldFallback();
   };
 
-  const stopHoldRecording = () => {
+  const stopHoldRecording = useCallback(() => {
+    if (holdMaxDurationTimeoutRef.current !== null) {
+      window.clearTimeout(holdMaxDurationTimeoutRef.current);
+      holdMaxDurationTimeoutRef.current = null;
+    }
+
     if (!isHoldingMicRef.current) {
       pendingMicReleaseRef.current = true;
       return;
@@ -1268,7 +1367,9 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
         // Ignore
       }
     }
-  };
+  }, [flushHoldSpeechTranscript]);
+
+  stopHoldRecordingRef.current = stopHoldRecording;
 
   const handlePointerMicDown = (e: React.PointerEvent) => {
     e.preventDefault();
@@ -1419,7 +1520,14 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
         <div className="absolute inset-x-0 bottom-0 z-20 px-5 pt-12 pb-[calc(1rem+env(safe-area-inset-bottom))] bg-gradient-to-t from-black/90 via-black/55 to-transparent flex flex-col items-center gap-3">
           {/* Discreet Live State Indicator Only */}
           <div className="min-h-[28px] flex items-center justify-center">
-            {isTalkingVisualActive && (
+            {(isConnectingNorthPole || callPhase === 'waiting-greeting') && (
+              <span className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-black/60 backdrop-blur-md border border-[#D4AF37]/40 text-xs font-medium text-[#F5D97E]">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#D4AF37]" aria-hidden="true" />
+                <span>Conectando ao Polo Norte...</span>
+              </span>
+            )}
+
+            {callPhase !== 'waiting-greeting' && isTalkingVisualActive && (
               <span className="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-black/60 backdrop-blur-md border border-[#D4AF37]/40 text-xs font-medium text-[#F5D97E]">
                 Papai Noel falando...
               </span>

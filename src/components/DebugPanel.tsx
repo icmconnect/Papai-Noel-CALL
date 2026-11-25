@@ -1,4 +1,4 @@
-import React, {useState} from 'react';
+import React, {useEffect, useState} from 'react';
 import {AlertTriangle, ArrowLeft, Loader2, Mic2, ShieldAlert, Sparkles, Volume2, VolumeX} from 'lucide-react';
 import {playSantaAudio, stopCurrentSantaVoice, unlockAudioContext} from '../utils/audioEngine';
 
@@ -12,6 +12,8 @@ const VOICE_OPTIONS = [
   {id: 'Charon', label: 'Charon · Voz grave e pausada'},
   {id: 'Alnilam', label: 'Alnilam · Voz firme e acolhedora'},
 ] as const;
+
+const VOICE_DESIGN_ID_REGEX = /^voice_[A-Za-z0-9_-]+$/;
 
 interface DebugTtsResponse {
   success?: boolean;
@@ -32,6 +34,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({onBack}) => {
   const [praise, setPraise] = useState('tomou banho sem reclamar seu fedido');
   const [advice, setAdvice] = useState('Tem que tomar mais banhos e lavar o suvaco porquinho.');
   const [voice, setVoice] = useState<string>('Algenib');
+  const [voiceDesignId, setVoiceDesignId] = useState<string | null>(null);
   const [forceGeminiOnly, setForceGeminiOnly] = useState<boolean>(true);
 
   const [isGenerating, setIsGenerating] = useState(false);
@@ -39,6 +42,23 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({onBack}) => {
   const [playedEngine, setPlayedEngine] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DebugTtsResponse | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    fetch('/api/health')
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data: {ttsVoice?: string} | null) => {
+        if (!active || !data?.ttsVoice) return;
+        const candidate = data.ttsVoice.trim();
+        if (VOICE_DESIGN_ID_REGEX.test(candidate)) {
+          setVoiceDesignId(candidate);
+        }
+      })
+      .catch(() => undefined);
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const handleTestVoice = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -266,6 +286,15 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({onBack}) => {
                     {opt.label}
                   </option>
                 ))}
+                <option
+                  value={voiceDesignId || '__voice_design_unconfigured__'}
+                  disabled={!voiceDesignId}
+                  className="bg-[#13151C] text-[#F7F4EC] disabled:text-[#6B7280]"
+                >
+                  {voiceDesignId
+                    ? 'Papai Noel (Voice Design)'
+                    : 'Papai Noel (Voice Design · configure GEMINI_TTS_VOICE=voice_...)'}
+                </option>
               </select>
             </div>
 
@@ -336,7 +365,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({onBack}) => {
               <div className="flex flex-wrap items-center gap-2">
                 <span
                   className={`px-3 py-1 rounded-full text-xs font-bold border ${
-                    resolvedVoiceSource === 'gemini-tts'
+                    resolvedVoiceSource === 'gemini-tts' || resolvedVoiceSource === 'audio-bank'
                       ? 'bg-emerald-500/15 border-emerald-400/40 text-emerald-300'
                       : 'bg-red-500/15 border-red-400/40 text-red-300'
                   }`}
