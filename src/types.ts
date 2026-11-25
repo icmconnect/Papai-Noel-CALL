@@ -8,7 +8,8 @@ export type AppScreen =
   | 'incoming'
   | 'call'
   | 'ended'
-  | 'audio-magic';
+  | 'audio-magic'
+  | 'my-magics';
 export type SantaVideoState = 'hello' | 'listening' | 'talking' | 'goodbye';
 
 export interface PlanOption {
@@ -130,9 +131,34 @@ export interface PreparedAudioMagic {
   useBrowserFallback?: boolean;
   voiceSource?: string;
   ttsError?: string | null;
+  isQuotaError?: boolean;
 }
 
 export interface ChatTurn {
   role: 'santa' | 'child';
   text: string;
+}
+
+export type AsaasPlanLinks = Record<PlanId, string | null>;
+
+export interface ParentProfileStats {
+  parentId: string;
+  name: string;
+  phone: string;
+  email: string;
+  conversions: number;
+  creditsEarned: number;
+  creditsRedeemed: number;
+  availableCredits: number;
+  neededForNextCredit: number;
+}
+
+export interface SavedMagicItem {
+  id: string;
+  type: 'audio' | 'video';
+  childName: string;
+  planId: PlanId;
+  shareUrl: string;
+  token: string;
+  createdAt: string;
 }

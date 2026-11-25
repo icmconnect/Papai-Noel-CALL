@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'crypto';
 import express, {type Request, type Response} from 'express';
 import fs from 'fs';
 import path from 'path';
@@ -80,6 +81,401 @@ const bridgeCache = new Map<string, CachedBridge>();
 const farewellCache = new Map<string, CachedFarewell>();
 const audioMagicCache = new Map<string, CachedAudioMagic>();
 const audioBank = new Map<string, {audioBase64: string; audioMimeType: string; text: string}>();
+
+const EPHEMERAL_FALLBACK_SECRET = crypto.randomBytes(32).toString('hex');
+function getHmacSecret(): string {
+  const envSecret = (process.env.SECRET || '').trim();
+  return envSecret || EPHEMERAL_FALLBACK_SECRET;
+}
+
+interface EntitlementPayload {
+  pid: string;
+  plan: PlanId;
+  iat: number;
+  exp: number;
+  ref?: string;
+}
+
+interface PaidPaymentRecord {
+  paymentId: string;
+  planId: PlanId;
+  status: string;
+  value?: number;
+  customerEmail?: string;
+  customerName?: string;
+  ref?: string;
+  verifiedAt: string;
+  source: 'webhook' | 'api' | 'both';
+  token: string;
+}
+
+interface SavedMagicRecord {
+  id: string;
+  type: 'audio' | 'video';
+  childName: string;
+  planId: PlanId;
+  shareUrl: string;
+  token: string;
+  createdAt: string;
+}
+
+interface ParentAccount {
+  parentId: string;
+  name: string;
+  phone: string;
+  email: string;
+  createdAt: string;
+  updatedAt: string;
+  creditsRedeemed: number;
+  magics: SavedMagicRecord[];
+}
+
+interface DigestEntry {
+  parentId: string;
+  name: string;
+  phone: string;
+  email: string;
+  planId?: string;
+  paymentId?: string;
+  registeredAt: string;
+}
+
+const paidPayments = new Map<string, PaidPaymentRecord>();
+const parentsMap = new Map<string, ParentAccount>();
+const parentEmailIndex = new Map<string, string>();
+const creditedPaymentsByRef = new Map<string, Set<string>>();
+const pendingDigestEntries: DigestEntry[] = [];
+let digestTimerStarted = false;
+
+function getAsaasApiBaseUrl(): string {
+  const custom = (process.env.ASAAS_API_URL || '').trim().replace(/\/$/, '');
+  if (custom && /^https?:\/\//i.test(custom)) {
+    return custom;
+  }
+  const envMode = (process.env.ASAAS_ENV || '').trim().toLowerCase();
+  if (envMode === 'sandbox') {
+    return 'https://api-sandbox.asaas.com/v3';
+  }
+  return 'https://api.asaas.com/v3';
+}
+
+function getAsaasPlanLinks(): Record<PlanId, string | null> {
+  const sanitize = (raw?: string): string | null => {
+    const val = (raw || '').trim();
+    if (!val) return null;
+    try {
+      const parsed = new URL(val);
+      return parsed.protocol === 'https:' || parsed.protocol === 'http:' ? parsed.toString() : null;
+    } catch {
+      return null;
+    }
+  };
+  return {
+    '15s': sanitize(process.env.ASAAS_LINK_15S),
+    '30s': sanitize(process.env.ASAAS_LINK_30S),
+    '60s': sanitize(process.env.ASAAS_LINK_60S),
+    familia: sanitize(process.env.ASAAS_LINK_FAMILIA),
+    audio: sanitize(process.env.ASAAS_LINK_AUDIO),
+  };
+}
+
+function timingSafeStringEqual(a: string, b: string): boolean {
+  const bufA = Buffer.from(a, 'utf8');
+  const bufB = Buffer.from(b, 'utf8');
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+function signEntitlementToken(payload: EntitlementPayload): string {
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sig = crypto.createHmac('sha256', getHmacSecret()).update(encoded).digest('base64url');
+  return `${encoded}.${sig}`;
+}
+
+function isPlanAuthorizedByToken(tokenPlan: PlanId, requiredPlan?: PlanId): boolean {
+  if (!requiredPlan) return true;
+  if (tokenPlan === requiredPlan) return true;
+  if (requiredPlan === 'audio') return tokenPlan === 'audio';
+  if (tokenPlan === 'familia') return true;
+  if (tokenPlan === '60s') return requiredPlan === '15s' || requiredPlan === '30s' || requiredPlan === '60s';
+  if (tokenPlan === '30s') return requiredPlan === '15s' || requiredPlan === '30s';
+  return false;
+}
+
+function verifyEntitlementToken(
+  token: string | undefined | null,
+  requiredPlan?: PlanId
+): EntitlementPayload | null {
+  if (!token || typeof token !== 'string') return null;
+  const trimmed = token.trim();
+  const dotIdx = trimmed.indexOf('.');
+  if (dotIdx <= 0 || dotIdx === trimmed.length - 1) return null;
+
+  const encoded = trimmed.slice(0, dotIdx);
+  const sig = trimmed.slice(dotIdx + 1);
+  const expectedSig = crypto
+    .createHmac('sha256', getHmacSecret())
+    .update(encoded)
+    .digest('base64url');
+
+  if (!timingSafeStringEqual(sig, expectedSig)) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as Partial<EntitlementPayload>;
+    if (
+      !parsed ||
+      typeof parsed.pid !== 'string' ||
+      !parsed.pid ||
+      typeof parsed.plan !== 'string' ||
+      typeof parsed.exp !== 'number' ||
+      parsed.exp <= Date.now()
+    ) {
+      return null;
+    }
+    const validPlans: PlanId[] = ['15s', '30s', '60s', 'familia', 'audio'];
+    if (!validPlans.includes(parsed.plan as PlanId)) {
+      return null;
+    }
+    if (!isPlanAuthorizedByToken(parsed.plan as PlanId, requiredPlan)) {
+      return null;
+    }
+    return parsed as EntitlementPayload;
+  } catch {
+    return null;
+  }
+}
+
+function extractEntitlementTokenFromReq(req: Request): string | null {
+  const bodyToken =
+    req.body && typeof (req.body as {token?: unknown}).token === 'string'
+      ? (req.body as {token: string}).token.trim()
+      : '';
+  if (bodyToken) return bodyToken;
+
+  const headerToken = (req.get('x-entitlement-token') || '').trim();
+  if (headerToken) return headerToken;
+
+  const authHeader = (req.get('authorization') || '').trim();
+  if (/^Bearer\s+/i.test(authHeader)) {
+    return authHeader.replace(/^Bearer\s+/i, '').trim();
+  }
+  return null;
+}
+
+function signParentSessionCookie(parentId: string): string {
+  const exp = Date.now() + 60 * 24 * 60 * 60 * 1000;
+  const payload = Buffer.from(JSON.stringify({parentId, exp}), 'utf8').toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', getHmacSecret())
+    .update(`parent:${payload}`)
+    .digest('base64url');
+  return `${payload}.${sig}`;
+}
+
+function verifyParentSessionCookie(raw: string | undefined | null): string | null {
+  if (!raw || typeof raw !== 'string') return null;
+  const dotIdx = raw.indexOf('.');
+  if (dotIdx <= 0 || dotIdx === raw.length - 1) return null;
+  const payload = raw.slice(0, dotIdx);
+  const sig = raw.slice(dotIdx + 1);
+  const expected = crypto
+    .createHmac('sha256', getHmacSecret())
+    .update(`parent:${payload}`)
+    .digest('base64url');
+  if (!timingSafeStringEqual(sig, expected)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as {
+      parentId?: string;
+      exp?: number;
+    };
+    if (!parsed.parentId || typeof parsed.exp !== 'number' || parsed.exp <= Date.now()) {
+      return null;
+    }
+    return parsed.parentId;
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(req: Request): Record<string, string> {
+  const header = req.headers.cookie || '';
+  const result: Record<string, string> = {};
+  for (const part of header.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = part.slice(0, eqIdx).trim();
+    const val = part.slice(eqIdx + 1).trim();
+    if (key) {
+      try {
+        result[key] = decodeURIComponent(val);
+      } catch {
+        result[key] = val;
+      }
+    }
+  }
+  return result;
+}
+
+function inferPlanIdFromPayment(params: {
+  requestedPlanId?: unknown;
+  externalReference?: unknown;
+  description?: unknown;
+  value?: unknown;
+}): PlanId {
+  const validPlans: PlanId[] = ['15s', '30s', '60s', 'familia', 'audio'];
+  if (typeof params.requestedPlanId === 'string' && validPlans.includes(params.requestedPlanId as PlanId)) {
+    return params.requestedPlanId as PlanId;
+  }
+  const refStr = typeof params.externalReference === 'string' ? params.externalReference.toLowerCase() : '';
+  const descStr = typeof params.description === 'string' ? params.description.toLowerCase() : '';
+  for (const candidate of validPlans) {
+    if (refStr.includes(`plan:${candidate}`) || refStr === candidate || descStr.includes(candidate)) {
+      return candidate;
+    }
+  }
+  if (descStr.includes('áudio mágico') || descStr.includes('audio magico')) return 'audio';
+  if (descStr.includes('família') || descStr.includes('familia')) return 'familia';
+  const numVal = typeof params.value === 'number' ? params.value : Number(params.value);
+  if (Number.isFinite(numVal) && numVal > 0) {
+    if (numVal <= 5.5) return 'audio';
+    if (numVal <= 12) return '15s';
+    if (numVal <= 22) return '30s';
+    if (numVal <= 32) return '60s';
+    return 'familia';
+  }
+  return '30s';
+}
+
+function extractRefFromExternalReference(externalReference?: unknown): string | undefined {
+  if (typeof externalReference !== 'string') return undefined;
+  const match = externalReference.match(/(?:^|\|)ref:(pai_[a-zA-Z0-9_-]{6,32})(?:\||$)/i);
+  if (match && match[1]) return match[1];
+  const bare = externalReference.trim();
+  return /^pai_[a-zA-Z0-9_-]{6,32}$/.test(bare) ? bare : undefined;
+}
+
+function sanitizeRefId(raw?: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined;
+  const trimmed = raw.trim();
+  return /^pai_[a-zA-Z0-9_-]{6,32}$/.test(trimmed) ? trimmed : undefined;
+}
+
+function recordReferralConversion(refParentId: string | undefined, paymentId: string): void {
+  if (!refParentId || !paymentId) return;
+  const set = creditedPaymentsByRef.get(refParentId) || new Set<string>();
+  set.add(paymentId);
+  creditedPaymentsByRef.set(refParentId, set);
+}
+
+function buildParentStats(account: ParentAccount) {
+  const conversions = creditedPaymentsByRef.get(account.parentId)?.size || 0;
+  const creditsEarned = Math.floor(conversions / 5);
+  const availableCredits = Math.max(0, creditsEarned - account.creditsRedeemed);
+  const remainder = conversions % 5;
+  const neededForNextCredit = remainder === 0 && conversions > 0 ? 5 : 5 - remainder;
+  return {
+    parentId: account.parentId,
+    name: account.name,
+    phone: account.phone,
+    email: account.email,
+    conversions,
+    creditsEarned,
+    creditsRedeemed: account.creditsRedeemed,
+    availableCredits,
+    neededForNextCredit,
+  };
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+async function sendDailyDigestViaResend(): Promise<{sent: boolean; count: number; reason?: string}> {
+  if (pendingDigestEntries.length === 0) {
+    return {sent: false, count: 0, reason: 'Nenhum novo registro pendente.'};
+  }
+  const apiKey = (process.env.RESEND_API_KEY || '').trim();
+  const ownerEmail = (process.env.OWNER_EMAIL || '').trim();
+  const fromEmail =
+    (process.env.RESEND_FROM_EMAIL || '').trim() || 'Chamada Papai Noel <onboarding@resend.dev>';
+
+  if (!apiKey || !ownerEmail) {
+    return {
+      sent: false,
+      count: pendingDigestEntries.length,
+      reason: 'RESEND_API_KEY ou OWNER_EMAIL não configurado.',
+    };
+  }
+
+  const batch = pendingDigestEntries.splice(0, pendingDigestEntries.length);
+  const rowsHtml = batch
+    .map(
+      (item) =>
+        `<tr>
+          <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(item.name)}</td>
+          <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(item.phone)}</td>
+          <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(item.email)}</td>
+          <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(item.planId || '-')}</td>
+          <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(item.parentId)}</td>
+          <td style="padding:8px;border:1px solid #ddd;">${escapeHtml(item.registeredAt)}</td>
+        </tr>`
+    )
+    .join('');
+
+  const html = `
+    <div style="font-family:sans-serif;color:#111;">
+      <h2>Resumo Diário de Pais Cadastrados (${batch.length})</h2>
+      <table style="border-collapse:collapse;width:100%;font-size:14px;">
+        <thead>
+          <tr style="background:#f5f5f5;">
+            <th style="padding:8px;border:1px solid #ddd;text-align:left;">Nome</th>
+            <th style="padding:8px;border:1px solid #ddd;text-align:left;">Telefone</th>
+            <th style="padding:8px;border:1px solid #ddd;text-align:left;">E-mail</th>
+            <th style="padding:8px;border:1px solid #ddd;text-align:left;">Plano</th>
+            <th style="padding:8px;border:1px solid #ddd;text-align:left;">ID Pai</th>
+            <th style="padding:8px;border:1px solid #ddd;text-align:left;">Data</th>
+          </tr>
+        </thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </div>
+  `;
+
+  try {
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: fromEmail,
+        to: [ownerEmail],
+        subject: `[Chamada Papai Noel] Digest Diário: ${batch.length} novo(s) pai(s)`,
+        html,
+      }),
+    });
+    if (!res.ok) {
+      pendingDigestEntries.unshift(...batch);
+      return {sent: false, count: batch.length, reason: `Resend HTTP ${res.status}`};
+    }
+    return {sent: true, count: batch.length};
+  } catch (err) {
+    pendingDigestEntries.unshift(...batch);
+    return {
+      sent: false,
+      count: batch.length,
+      reason: err instanceof Error ? err.message : 'Erro ao enviar digest.',
+    };
+  }
+}
 
 let roundRobinKeyIndex = 0;
 
@@ -1015,22 +1411,35 @@ function pickNonRepeatingReplyFallback(childName: string, history: ChatTurn[]): 
 }
 
 function resolvePublicBaseUrl(req: Request): string {
+  const reqHost = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
   const envAppUrl = (process.env.APP_URL || '').trim().replace(/\/$/, '');
-  if (envAppUrl && envAppUrl !== 'MY_APP_URL') {
+  if (envAppUrl && envAppUrl !== 'MY_APP_URL' && /^https?:\/\//i.test(envAppUrl)) {
     return envAppUrl;
   }
   const reqOrigin = (req.get('origin') || '').trim();
-  if (reqOrigin) {
+  if (reqOrigin && /^https?:\/\//i.test(reqOrigin)) {
     return reqOrigin.replace(/\/$/, '');
   }
   const forwardedProto = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
   const proto = forwardedProto || req.protocol || 'https';
-  const host = (
-    req.get('x-forwarded-host') ||
-    req.get('host') ||
-    'chamada-papai-noel.onrender.com'
-  ).trim();
+  const host = reqHost || 'localhost:3000';
   return `${proto}://${host}`;
+}
+
+function applyAppUrlToHtml(html: string, baseUrl: string): string {
+  return html
+    .replace(/https:\/\/chamada-papai-noel\.onrender\.com/g, baseUrl)
+    .replace(/content="\/santa-avatar\.png"/g, `content="${baseUrl}/santa-avatar.png"`)
+    .replace(/"image":\s*"\/santa-avatar\.png"/g, `"image": "${baseUrl}/santa-avatar.png"`);
+}
+
+function applyAppUrlToLlmsTxt(txt: string, baseUrl: string): string {
+  return txt
+    .replace(/https:\/\/chamada-papai-noel\.onrender\.com/g, baseUrl)
+    .replace(/:\s*\/\n/g, `: ${baseUrl}/\n`)
+    .replace(/:\s*\/sitemap\.xml/g, `: ${baseUrl}/sitemap.xml`)
+    .replace(/:\s*\/robots\.txt/g, `: ${baseUrl}/robots.txt`)
+    .replace(/\bem\s+\/\s*$/gm, `em ${baseUrl}/`);
 }
 
 const MAX_CHILD_NAME_CHARS = 60;
@@ -1245,11 +1654,33 @@ async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
 
+  if (!digestTimerStarted) {
+    digestTimerStarted = true;
+    setInterval(() => {
+      void sendDailyDigestViaResend();
+    }, 24 * 60 * 60 * 1000).unref();
+  }
+
+  // Webhook Asaas captura rawBody para validação HMAC-SHA256 / asaas-access-token
+  app.use(
+    '/api/pay/asaas',
+    express.json({
+      limit: '1mb',
+      verify: (req, _res, buf) => {
+        (req as Request & {rawBody?: Buffer}).rawBody = buf;
+      },
+    })
+  );
+
   // Limite estrito de 2MB em /api/santa/reply e /api/santa/audio; demais rotas mantêm parsing JSON padrão
   app.use('/api/santa/reply', express.json({limit: '2mb'}));
   app.use('/api/santa/audio', express.json({limit: '2mb'}));
   app.use((req: Request, res: Response, next) => {
-    if (req.path === '/api/santa/reply' || req.path === '/api/santa/audio') {
+    if (
+      req.path === '/api/santa/reply' ||
+      req.path === '/api/santa/audio' ||
+      req.path === '/api/pay/asaas'
+    ) {
       next();
       return;
     }
@@ -1311,14 +1742,16 @@ async function startServer() {
     res.type('application/xml; charset=utf-8').send(xml);
   });
 
-  app.get('/llms.txt', (_req: Request, res: Response) => {
+  app.get('/llms.txt', (req: Request, res: Response) => {
+    const baseUrl = resolvePublicBaseUrl(req);
     const candidates = [
       path.resolve(__dirname, 'public', 'llms.txt'),
       path.resolve(__dirname, 'dist', 'llms.txt'),
     ];
     const targetFile = candidates.find((p) => fs.existsSync(p));
     if (targetFile) {
-      res.type('text/plain; charset=utf-8').send(fs.readFileSync(targetFile, 'utf8'));
+      const content = applyAppUrlToLlmsTxt(fs.readFileSync(targetFile, 'utf8'), baseUrl);
+      res.type('text/plain; charset=utf-8').send(content);
       return;
     }
     res.status(404).type('text/plain; charset=utf-8').send('llms.txt não encontrado.');
@@ -1332,6 +1765,452 @@ async function startServer() {
       ttsModel: resolveSantaTtsModel(),
       ttsVoice: resolveSantaTtsVoice(),
     });
+  });
+
+  app.get('/api/pay/config', (req: Request, res: Response) => {
+    res.json({
+      appUrl: resolvePublicBaseUrl(req),
+      links: getAsaasPlanLinks(),
+    });
+  });
+
+  app.post('/api/pay/validate-token', (req: Request, res: Response) => {
+    const body = (req.body || {}) as {token?: string; planId?: PlanId};
+    const token = typeof body.token === 'string' ? body.token : extractEntitlementTokenFromReq(req);
+    const validPayload = verifyEntitlementToken(token, body.planId);
+    if (!validPayload) {
+      res.status(402).json({valid: false, error: 'Token de acesso ausente ou inválido.'});
+      return;
+    }
+    res.json({
+      valid: true,
+      pid: validPayload.pid,
+      planId: validPayload.plan,
+      exp: validPayload.exp,
+      ref: validPayload.ref,
+    });
+  });
+
+  app.post('/api/pay/asaas', (req: Request, res: Response) => {
+    const webhookSecret = (process.env.ASAAS_WEBHOOK_TOKEN || '').trim();
+    const envSecret = (process.env.SECRET || '').trim();
+    const authSecret = webhookSecret || envSecret;
+
+    if (!authSecret) {
+      res.status(503).json({error: 'ASAAS_WEBHOOK_TOKEN ou SECRET não configurado no servidor.'});
+      return;
+    }
+
+    const accessTokenHeader = (req.get('asaas-access-token') || '').trim();
+    const sigHeaderRaw = (
+      req.get('x-asaas-signature') ||
+      req.get('asaas-signature') ||
+      ''
+    ).trim();
+
+    let signatureValid = false;
+    if (accessTokenHeader && timingSafeStringEqual(accessTokenHeader, authSecret)) {
+      signatureValid = true;
+    } else if (sigHeaderRaw) {
+      const rawBody =
+        (req as Request & {rawBody?: Buffer}).rawBody ||
+        Buffer.from(JSON.stringify(req.body || {}), 'utf8');
+      const normalizedSig = sigHeaderRaw.replace(/^sha256=/i, '');
+      const expectedHex = crypto.createHmac('sha256', authSecret).update(rawBody).digest('hex');
+      const expectedBase64 = crypto
+        .createHmac('sha256', authSecret)
+        .update(rawBody)
+        .digest('base64');
+      if (
+        timingSafeStringEqual(normalizedSig.toLowerCase(), expectedHex.toLowerCase()) ||
+        timingSafeStringEqual(normalizedSig, expectedBase64)
+      ) {
+        signatureValid = true;
+      }
+    }
+
+    if (!signatureValid) {
+      res.status(401).json({error: 'Assinatura do webhook Asaas inválida.'});
+      return;
+    }
+
+    interface AsaasWebhookPayment {
+      id?: string;
+      status?: string;
+      value?: number;
+      description?: string;
+      externalReference?: string;
+      customerEmail?: string;
+      customerName?: string;
+    }
+
+    const body = (req.body || {}) as AsaasWebhookPayment & {
+      event?: string;
+      payment?: AsaasWebhookPayment;
+    };
+
+    const payment: AsaasWebhookPayment = body.payment || body;
+    const paymentId = typeof payment.id === 'string' ? payment.id.trim() : '';
+    const event = (body.event || '').toUpperCase();
+    const status = (payment.status || '').toUpperCase();
+
+    const isPaidEvent =
+      event === 'PAYMENT_CONFIRMED' ||
+      event === 'PAYMENT_RECEIVED' ||
+      event === 'PAYMENT_RECEIVED_IN_CASH' ||
+      status === 'CONFIRMED' ||
+      status === 'RECEIVED' ||
+      status === 'RECEIVED_IN_CASH' ||
+      status === 'PAID';
+
+    if (!paymentId || !/^[A-Za-z0-9_-]{3,80}$/.test(paymentId)) {
+      res.status(400).json({error: 'payment.id inválido no payload Asaas.'});
+      return;
+    }
+
+    if (!isPaidEvent) {
+      res.json({ok: true, received: true, paid: false, paymentId, status});
+      return;
+    }
+
+    const existing = paidPayments.get(paymentId);
+    const planId =
+      existing?.planId ||
+      inferPlanIdFromPayment({
+        externalReference: payment.externalReference,
+        description: payment.description,
+        value: payment.value,
+      });
+    const ref = existing?.ref || extractRefFromExternalReference(payment.externalReference);
+    const token =
+      existing?.token ||
+      signEntitlementToken({
+        pid: paymentId,
+        plan: planId,
+        iat: Date.now(),
+        exp: Date.now() + 30 * 24 * 60 * 60 * 1000,
+        ...(ref ? {ref} : {}),
+      });
+
+    paidPayments.set(paymentId, {
+      paymentId,
+      planId,
+      status: status || 'CONFIRMED',
+      value: typeof payment.value === 'number' ? payment.value : existing?.value,
+      customerEmail: payment.customerEmail || existing?.customerEmail,
+      customerName: payment.customerName || existing?.customerName,
+      ref,
+      verifiedAt: new Date().toISOString(),
+      source: existing?.source === 'api' ? 'both' : existing?.source || 'webhook',
+      token,
+    });
+
+    if (ref) {
+      recordReferralConversion(ref, paymentId);
+    }
+
+    res.json({ok: true, received: true, paid: true, paymentId, planId, token});
+  });
+
+  app.post('/api/pay/confirm', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body || {}) as {paymentId?: string; planId?: PlanId; ref?: string};
+      const paymentId = typeof body.paymentId === 'string' ? body.paymentId.trim() : '';
+      if (!paymentId || !/^[A-Za-z0-9_-]{3,80}$/.test(paymentId)) {
+        res.status(400).json({paid: false, error: 'ID do pagamento inválido.'});
+        return;
+      }
+
+      const webhookRecord = paidPayments.get(paymentId);
+      const asaasApiKey = (process.env.ASAAS_API_KEY || '').trim();
+      const incomingRef = sanitizeRefId(body.ref);
+
+      let apiConfirmed = false;
+      let apiPaymentData: {
+        status?: string;
+        value?: number;
+        description?: string;
+        externalReference?: string;
+      } | null = null;
+
+      if (asaasApiKey) {
+        const apiRes = await fetch(
+          `${getAsaasApiBaseUrl()}/payments/${encodeURIComponent(paymentId)}`,
+          {
+            method: 'GET',
+            headers: {
+              access_token: asaasApiKey,
+              'User-Agent': 'aistudio-build',
+            },
+          }
+        );
+        if (apiRes.ok) {
+          apiPaymentData = (await apiRes.json()) as {
+            status?: string;
+            value?: number;
+            description?: string;
+            externalReference?: string;
+          };
+          const apiStatus = (apiPaymentData.status || '').toUpperCase();
+          apiConfirmed =
+            apiStatus === 'RECEIVED' ||
+            apiStatus === 'CONFIRMED' ||
+            apiStatus === 'RECEIVED_IN_CASH' ||
+            apiStatus === 'PAID';
+        }
+      }
+
+      const isConfirmed = apiConfirmed || Boolean(webhookRecord);
+      if (!isConfirmed) {
+        res.status(402).json({
+          paid: false,
+          error: asaasApiKey
+            ? 'Pagamento ainda não confirmado na API do Asaas.'
+            : 'Pagamento não localizado via webhook Asaas.',
+        });
+        return;
+      }
+
+      const finalPlanId =
+        webhookRecord?.planId ||
+        inferPlanIdFromPayment({
+          requestedPlanId: body.planId,
+          externalReference: apiPaymentData?.externalReference,
+          description: apiPaymentData?.description,
+          value: apiPaymentData?.value,
+        });
+
+      const finalRef =
+        webhookRecord?.ref ||
+        extractRefFromExternalReference(apiPaymentData?.externalReference) ||
+        incomingRef;
+
+      const token =
+        webhookRecord?.token ||
+        signEntitlementToken({
+          pid: paymentId,
+          plan: finalPlanId,
+          iat: Date.now(),
+          exp: Date.now() + 30 * 24 * 60 * 60 * 1000,
+          ...(finalRef ? {ref: finalRef} : {}),
+        });
+
+      const source: PaidPaymentRecord['source'] =
+        apiConfirmed && webhookRecord ? 'both' : apiConfirmed ? 'api' : 'webhook';
+
+      paidPayments.set(paymentId, {
+        paymentId,
+        planId: finalPlanId,
+        status: apiPaymentData?.status || webhookRecord?.status || 'CONFIRMED',
+        value: apiPaymentData?.value ?? webhookRecord?.value,
+        ref: finalRef,
+        verifiedAt: new Date().toISOString(),
+        source,
+        token,
+      });
+
+      if (finalRef) {
+        recordReferralConversion(finalRef, paymentId);
+      }
+
+      res.json({
+        paid: true,
+        doubleConfirmed: apiConfirmed || source === 'webhook' || source === 'both',
+        source,
+        paymentId,
+        planId: finalPlanId,
+        token,
+        ...(finalRef ? {ref: finalRef} : {}),
+      });
+    } catch (err) {
+      res.status(500).json({paid: false, error: extractReadableError(err)});
+    }
+  });
+
+  app.post('/api/parents/register', (req: Request, res: Response) => {
+    const token = extractEntitlementTokenFromReq(req);
+    const entitlement = verifyEntitlementToken(token);
+    if (!entitlement) {
+      res.status(402).json({error: 'Pagamento confirmado necessário para concluir o cadastro.'});
+      return;
+    }
+
+    const body = (req.body || {}) as {
+      name?: string;
+      phone?: string;
+      email?: string;
+      planId?: string;
+    };
+
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    const phone = typeof body.phone === 'string' ? body.phone.trim() : '';
+    const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+
+    if (name.length < 2 || name.length > 80) {
+      res.status(400).json({error: 'Informe seu nome completo (2 a 80 caracteres).'});
+      return;
+    }
+    const phoneDigits = phone.replace(/\D/g, '');
+    if (phoneDigits.length < 8 || phone.length > 30) {
+      res.status(400).json({error: 'Informe um telefone/WhatsApp válido com DDD.'});
+      return;
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 120) {
+      res.status(400).json({error: 'Informe um e-mail válido.'});
+      return;
+    }
+
+    const existingId = parentEmailIndex.get(email);
+    const nowIso = new Date().toISOString();
+    let account: ParentAccount;
+    if (existingId && parentsMap.has(existingId)) {
+      account = parentsMap.get(existingId)!;
+      account.name = name;
+      account.phone = phone;
+      account.updatedAt = nowIso;
+    } else {
+      const parentId = `pai_${crypto.randomBytes(5).toString('hex')}`;
+      account = {
+        parentId,
+        name,
+        phone,
+        email,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        creditsRedeemed: 0,
+        magics: [],
+      };
+      parentsMap.set(parentId, account);
+      parentEmailIndex.set(email, parentId);
+    }
+
+    pendingDigestEntries.push({
+      parentId: account.parentId,
+      name: account.name,
+      phone: account.phone,
+      email: account.email,
+      planId: entitlement.plan,
+      paymentId: entitlement.pid,
+      registeredAt: nowIso,
+    });
+
+    if (pendingDigestEntries.length >= 25) {
+      void sendDailyDigestViaResend();
+    }
+
+    const cookieVal = signParentSessionCookie(account.parentId);
+    res.cookie('santa_parent_session', cookieVal, {
+      httpOnly: true,
+      secure: true,
+      sameSite: 'none',
+      partitioned: true,
+      maxAge: 60 * 24 * 60 * 60 * 1000,
+    });
+
+    res.json({
+      parent: buildParentStats(account),
+      magics: account.magics,
+    });
+  });
+
+  app.get('/api/parents/me', (req: Request, res: Response) => {
+    const cookies = parseCookies(req);
+    const cookieParentId = verifyParentSessionCookie(cookies.santa_parent_session);
+    if (!cookieParentId || !parentsMap.has(cookieParentId)) {
+      res.status(404).json({error: 'Sessão de responsável não encontrada.'});
+      return;
+    }
+    const account = parentsMap.get(cookieParentId)!;
+    res.json({
+      parent: buildParentStats(account),
+      magics: account.magics,
+    });
+  });
+
+  app.post('/api/parents/save-magic', (req: Request, res: Response) => {
+    const cookies = parseCookies(req);
+    const cookieParentId = verifyParentSessionCookie(cookies.santa_parent_session);
+    const token = extractEntitlementTokenFromReq(req);
+    const entitlement = verifyEntitlementToken(token);
+    if (!cookieParentId || !parentsMap.has(cookieParentId) || !entitlement) {
+      res.status(401).json({error: 'Cadastro do responsável e pagamento válidos obrigatórios.'});
+      return;
+    }
+
+    const body = (req.body || {}) as {
+      type?: 'audio' | 'video';
+      childName?: string;
+      planId?: PlanId;
+      shareUrl?: string;
+    };
+    const shareUrl = typeof body.shareUrl === 'string' ? body.shareUrl.trim() : '';
+    if (!shareUrl || !/^https?:\/\//i.test(shareUrl)) {
+      res.status(400).json({error: 'URL da magia inválida.'});
+      return;
+    }
+
+    const account = parentsMap.get(cookieParentId)!;
+    const item: SavedMagicRecord = {
+      id: `mag_${crypto.randomBytes(4).toString('hex')}`,
+      type: body.type === 'audio' ? 'audio' : 'video',
+      childName: (body.childName || 'Criança').trim().slice(0, 60),
+      planId: entitlement.plan,
+      shareUrl,
+      token: token!,
+      createdAt: new Date().toISOString(),
+    };
+    account.magics = [item, ...account.magics.filter((m) => m.shareUrl !== shareUrl)].slice(0, 50);
+
+    res.json({
+      parent: buildParentStats(account),
+      magics: account.magics,
+    });
+  });
+
+  app.post('/api/parents/redeem-credit', (req: Request, res: Response) => {
+    const cookies = parseCookies(req);
+    const cookieParentId = verifyParentSessionCookie(cookies.santa_parent_session);
+    if (!cookieParentId || !parentsMap.has(cookieParentId)) {
+      res.status(401).json({error: 'Faça seu cadastro pós-pagamento para resgatar créditos.'});
+      return;
+    }
+
+    const account = parentsMap.get(cookieParentId)!;
+    const stats = buildParentStats(account);
+    if (stats.availableCredits < 1) {
+      res.status(400).json({
+        error: `Faltam ${stats.neededForNextCredit} indicações pagas para liberar uma chamada grátis.`,
+      });
+      return;
+    }
+
+    account.creditsRedeemed += 1;
+    const creditPid = `credit_${crypto.randomBytes(6).toString('hex')}`;
+    const token = signEntitlementToken({
+      pid: creditPid,
+      plan: '60s',
+      iat: Date.now(),
+      exp: Date.now() + 30 * 24 * 60 * 60 * 1000,
+      ref: account.parentId,
+    });
+
+    res.json({
+      token,
+      planId: '60s',
+      parent: buildParentStats(account),
+    });
+  });
+
+  app.post('/api/admin/send-digest', async (req: Request, res: Response) => {
+    const authHeader = (req.get('authorization') || '').trim();
+    const bearer = authHeader.replace(/^Bearer\s+/i, '').trim();
+    const envSecret = (process.env.SECRET || '').trim();
+    if (!envSecret || !bearer || !timingSafeStringEqual(bearer, envSecret)) {
+      res.status(401).json({error: 'Não autorizado.'});
+      return;
+    }
+    const result = await sendDailyDigestViaResend();
+    res.json(result);
   });
 
   // Voice Test Debug Endpoint with Disk & Composite-Key Memory Audio Bank + Gemini TTS
@@ -1502,7 +2381,20 @@ async function startServer() {
       createRequestAbortController(req, res);
 
     try {
-      const body = (req.body || {}) as GreetingBody;
+      const body = (req.body || {}) as GreetingBody & {token?: string};
+      const requestedPlan: PlanId = body.planId || '30s';
+      const entitlement = verifyEntitlementToken(
+        extractEntitlementTokenFromReq(req),
+        requestedPlan
+      );
+      if (!entitlement) {
+        res.status(402).json({
+          requiresCheckout: true,
+          error: 'Pagamento confirmado necessário para iniciar esta ligação.',
+        });
+        return;
+      }
+
       const validation = validateParentFields({
         childName: body.childName,
         praise: body.praise,
@@ -1517,7 +2409,7 @@ async function startServer() {
       const childAge = typeof body.childAge === 'string' ? body.childAge.trim().slice(0, 12) : '';
       const praise = validation.praise;
       const advice = validation.advice;
-      const planId: PlanId = body.planId || '30s';
+      const planId: PlanId = requestedPlan;
       const farewellType = normalizeFarewellType(body.farewellType);
 
       const isQuick15sPlan = planId === '15s';
@@ -1790,7 +2682,12 @@ Instruções para farewellText (ATO 3 — despedida final curta, NO MÁXIMO 90 c
 
   app.post('/api/santa/farewell', async (req: Request, res: Response) => {
     try {
-      const body = (req.body || {}) as FarewellBody;
+      const body = (req.body || {}) as FarewellBody & {token?: string};
+      const entitlement = verifyEntitlementToken(extractEntitlementTokenFromReq(req));
+      if (!entitlement || entitlement.plan === 'audio') {
+        res.status(402).json({requiresCheckout: true, error: 'Token de chamada inválido ou ausente.'});
+        return;
+      }
       const validation = validateParentFields({childName: body.childName});
       if (!validation.ok) {
         res.status(400).json({error: validation.error});
@@ -1849,6 +2746,12 @@ Instruções para farewellText (ATO 3 — despedida final curta, NO MÁXIMO 90 c
 
   // Zero-latency streaming reply endpoint using chunked transfer encoding (NDJSON stream chunks)
   app.post('/api/santa/reply', checkReplyRateLimit, async (req: Request, res: Response) => {
+    const entitlement = verifyEntitlementToken(extractEntitlementTokenFromReq(req));
+    if (!entitlement || entitlement.plan === 'audio') {
+      res.status(402).json({requiresCheckout: true, error: 'Token de chamada inválido ou ausente.'});
+      return;
+    }
+
     const body = (req.body || {}) as ReplyBody;
     const validation = validateParentFields({
       childName: body.childName,
@@ -2070,12 +2973,23 @@ REGRAS OBRIGATÓRIAS:
       createRequestAbortController(req, res);
 
     try {
+      const token = extractEntitlementTokenFromReq(req);
+      const entitlement = verifyEntitlementToken(token, 'audio');
+      if (!entitlement) {
+        res.status(402).json({
+          requiresCheckout: true,
+          error: 'Pagamento confirmado necessário para gerar o Áudio Mágico.',
+        });
+        return;
+      }
+
       const body = (req.body || {}) as {
         childName?: string;
         childAge?: string;
         praise?: string;
         advice?: string;
         audioText?: string;
+        ref?: string;
       };
 
       const validation = validateParentFields(
@@ -2104,6 +3018,7 @@ REGRAS OBRIGATÓRIAS:
       const presetScript = presetTextRes.value
         ? prepareSantaSpeechScript(presetTextRes.value, 180)
         : '';
+      const refId = sanitizeRefId(body.ref);
 
       const cacheKey = `${childName.toLowerCase()}|${childAge}|${praise}|${advice}|${presetScript}`;
       const baseUrl = resolvePublicBaseUrl(req);
@@ -2119,7 +3034,11 @@ REGRAS OBRIGATÓRIAS:
           }),
           'utf8'
         ).toString('base64url');
-        return `${baseUrl}/?audio=${sharePayload}`;
+        const params = new URLSearchParams();
+        params.set('audio', sharePayload);
+        if (token) params.set('token', token);
+        if (refId) params.set('ref', refId);
+        return `${baseUrl}/?${params.toString()}`;
       };
 
       const cached = audioMagicCache.get(cacheKey);
@@ -2204,6 +3123,10 @@ REGRAS OBRIGATÓRIAS:
         });
       }
 
+      const isQuotaError = Boolean(
+        synth.ttsError && /429|RESOURCE_EXHAUSTED|limite|cota/i.test(synth.ttsError)
+      );
+
       res.json({
         audioBase64: synth.audioBase64,
         audioMimeType: synth.audioMimeType,
@@ -2212,6 +3135,7 @@ REGRAS OBRIGATÓRIAS:
         shareUrl: buildShareUrl(audioText),
         useBrowserFallback: false,
         voiceSource: synth.audioBase64 ? synth.voiceSource : 'none',
+        isQuotaError,
         ...(synth.ttsError ? {ttsError: synth.ttsError} : {}),
       });
     } catch (error) {
@@ -2228,11 +3152,25 @@ REGRAS OBRIGATÓRIAS:
 
   app.post('/api/parent/magic-link', async (req: Request, res: Response) => {
     try {
-      const {email, config} = req.body as {email?: string; config?: GreetingBody};
+      const {email, config, ref} = req.body as {
+        email?: string;
+        config?: GreetingBody;
+        ref?: string;
+      };
       if (!config) {
         res.status(400).json({error: 'Informe os dados da chamada para gerar o link mágico.'});
         return;
       }
+      const token = extractEntitlementTokenFromReq(req);
+      const entitlement = verifyEntitlementToken(token, config.planId || '30s');
+      if (!entitlement) {
+        res.status(402).json({
+          requiresCheckout: true,
+          error: 'Pagamento confirmado necessário para gerar Link Mágico.',
+        });
+        return;
+      }
+
       const validation = validateParentFields(
         {
           childName: config.childName,
@@ -2247,7 +3185,13 @@ REGRAS OBRIGATÓRIAS:
       }
       const payload = Buffer.from(JSON.stringify(config), 'utf8').toString('base64url');
       const baseUrl = resolvePublicBaseUrl(req);
-      const magicUrl = `${baseUrl}/?chamada=${payload}`;
+      const params = new URLSearchParams();
+      params.set('chamada', payload);
+      if (token) params.set('token', token);
+      const validRef = sanitizeRefId(ref);
+      if (validRef) params.set('ref', validRef);
+
+      const magicUrl = `${baseUrl}/?${params.toString()}`;
       const recipientEmail = (email || '').trim();
 
       res.json({
@@ -2267,16 +3211,40 @@ REGRAS OBRIGATÓRIAS:
     const {createServer: createViteServer} = await import('vite');
     const vite = await createViteServer({
       server: {middlewareMode: true},
-      appType: 'spa',
+      appType: 'custom',
     });
     app.use(vite.middlewares);
+    app.use('*', async (req: Request, res: Response, next) => {
+      if (
+        req.method !== 'GET' ||
+        req.originalUrl.startsWith('/api/') ||
+        !req.headers.accept?.includes('text/html')
+      ) {
+        next();
+        return;
+      }
+      try {
+        const indexPath = path.resolve(__dirname, 'index.html');
+        const template = fs.readFileSync(indexPath, 'utf-8');
+        const transformed = await vite.transformIndexHtml(req.originalUrl, template);
+        const baseUrl = resolvePublicBaseUrl(req);
+        res
+          .status(200)
+          .set({'Content-Type': 'text/html; charset=utf-8'})
+          .end(applyAppUrlToHtml(transformed, baseUrl));
+      } catch (err) {
+        next(err);
+      }
+    });
   } else {
     const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req: Request, res: Response) => {
+    app.use(express.static(distPath, {index: false}));
+    app.get('*', (req: Request, res: Response) => {
       const indexFile = path.join(distPath, 'index.html');
       if (fs.existsSync(indexFile)) {
-        res.sendFile(indexFile);
+        const baseUrl = resolvePublicBaseUrl(req);
+        const html = applyAppUrlToHtml(fs.readFileSync(indexFile, 'utf8'), baseUrl);
+        res.type('text/html; charset=utf-8').send(html);
       } else {
         res.status(404).send('Build não encontrado.');
       }

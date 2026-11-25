@@ -1,6 +1,27 @@
 import React, {useEffect, useState} from 'react';
-import {ArrowLeft, Check, Copy, Loader2, Mail, PhoneCall, Send, Sparkles, Volume2} from 'lucide-react';
-import {CallConfig, FAREWELL_OPTIONS, PLANS, PlanId} from '../types';
+import {
+  ArrowLeft,
+  Check,
+  Copy,
+  CreditCard,
+  ExternalLink,
+  FolderHeart,
+  Loader2,
+  Lock,
+  Mail,
+  PhoneCall,
+  Send,
+  Sparkles,
+  Volume2,
+} from 'lucide-react';
+import {
+  AsaasPlanLinks,
+  CallConfig,
+  FAREWELL_OPTIONS,
+  PLANS,
+  PlanId,
+  SavedMagicItem,
+} from '../types';
 
 interface ParentPanelProps {
   config: CallConfig;
@@ -10,6 +31,35 @@ interface ParentPanelProps {
   onGenerateAudioMagic?: () => void;
   isGeneratingAudio?: boolean;
   error: string | null;
+  asaasLinks: AsaasPlanLinks;
+  entitlementToken: string | null;
+  paidPlanId: PlanId | null;
+  parentId?: string | null;
+  referrerId?: string | null;
+  onOpenMyMagics?: () => void;
+  onMagicLinkCreated?: (item: SavedMagicItem) => void;
+}
+
+const PENDING_CHECKOUT_STORAGE_KEY = 'santa_pending_checkout';
+
+function isPlanAuthorized(paidPlan: PlanId | null, token: string | null, targetPlan: PlanId): boolean {
+  if (!token || !paidPlan) return false;
+  if (paidPlan === targetPlan) return true;
+  if (targetPlan === 'audio') return paidPlan === 'audio';
+  if (paidPlan === 'familia') return true;
+  if (paidPlan === '60s') return targetPlan === '15s' || targetPlan === '30s' || targetPlan === '60s';
+  if (paidPlan === '30s') return targetPlan === '15s' || targetPlan === '30s';
+  return false;
+}
+
+function isSafeHttpUrl(url: string | null | undefined): url is string {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
+  } catch {
+    return false;
+  }
 }
 
 export const ParentPanel: React.FC<ParentPanelProps> = ({
@@ -20,12 +70,20 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
   onGenerateAudioMagic,
   isGeneratingAudio = false,
   error,
+  asaasLinks,
+  entitlementToken,
+  paidPlanId,
+  parentId,
+  referrerId,
+  onOpenMyMagics,
+  onMagicLinkCreated,
 }) => {
   const [magicLink, setMagicLink] = useState<string | null>(null);
   const [isSendingLink, setIsSendingLink] = useState(false);
   const [linkError, setLinkError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [checkoutNotice, setCheckoutNotice] = useState<string | null>(null);
   const [ctaCountdown, setCtaCountdown] = useState<number>(10);
 
   useEffect(() => {
@@ -47,10 +105,48 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
     onChange({...config, [key]: value});
   };
 
+  const persistPendingCheckout = (targetPlanId: PlanId) => {
+    try {
+      sessionStorage.setItem(
+        PENDING_CHECKOUT_STORAGE_KEY,
+        JSON.stringify({
+          config: {...config, planId: targetPlanId},
+          ref: referrerId || undefined,
+          savedAt: Date.now(),
+        })
+      );
+    } catch {
+      // Ignore storage failures
+    }
+  };
+
+  const handleSelectPlanCheckout = (planId: PlanId, e?: React.MouseEvent) => {
+    if (e) {
+      e.stopPropagation();
+    }
+    setCheckoutNotice(null);
+    updateField('planId', planId);
+    persistPendingCheckout(planId);
+
+    const url = asaasLinks[planId];
+    if (!isSafeHttpUrl(url)) {
+      if (e) {
+        e.preventDefault();
+      }
+      setCheckoutNotice(
+        `Link de checkout Asaas não configurado no servidor para este plano (ASAAS_LINK_${planId.toUpperCase()}).`
+      );
+    }
+  };
+
   const handleGenerateMagicLink = async () => {
     setLinkError(null);
     if (!config.childName.trim()) {
       setLinkError('Preencha o nome da criança antes de gerar o link mágico.');
+      return;
+    }
+    if (!entitlementToken || !isPlanAuthorized(paidPlanId, entitlementToken, config.planId)) {
+      setLinkError('Faça o pagamento do plano selecionado para liberar a criação do Link Mágico.');
       return;
     }
 
@@ -58,10 +154,15 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
     try {
       const res = await fetch('/api/parent/magic-link', {
         method: 'POST',
-        headers: {'Content-Type': 'application/json'},
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${entitlementToken}`,
+        },
         body: JSON.stringify({
           email: config.parentEmail,
           config,
+          token: entitlementToken,
+          ...(parentId ? {ref: parentId} : {}),
         }),
       });
       const data = await res.json();
@@ -69,6 +170,15 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
         throw new Error(data.error || 'Erro ao gerar link mágico.');
       }
       setMagicLink(data.magicUrl);
+      onMagicLinkCreated?.({
+        id: `vid_${Date.now()}`,
+        type: 'video',
+        childName: config.childName.trim(),
+        planId: config.planId,
+        shareUrl: data.magicUrl,
+        token: entitlementToken,
+        createdAt: new Date().toISOString(),
+      });
     } catch (err) {
       setLinkError(err instanceof Error ? err.message : 'Erro ao gerar link mágico.');
     } finally {
@@ -87,8 +197,18 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
     }
   };
 
+  const selectedPlan = PLANS.find((p) => p.id === config.planId) || PLANS[3];
+  const isAudioPlan = selectedPlan.id === 'audio';
+  const isSelectedPlanPaid = isPlanAuthorized(paidPlanId, entitlementToken, selectedPlan.id);
+  const selectedAsaasUrl = asaasLinks[selectedPlan.id];
+  const farewellSeconds = selectedPlan.durationSeconds <= 15 ? 3 : 6;
+
   const handleStartCall = (e: React.FormEvent) => {
     e.preventDefault();
+    if (!isSelectedPlanPaid) {
+      setFormError('Selecione e conclua o pagamento do plano antes de iniciar.');
+      return;
+    }
     if (!config.childName.trim()) {
       setFormError('Por favor, informe o nome da criança para o Papai Noel chamar.');
       return;
@@ -101,15 +221,11 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
     onStartCountdown();
   };
 
-  const selectedPlan = PLANS.find((p) => p.id === config.planId) || PLANS[3];
-  const isAudioPlan = selectedPlan.id === 'audio';
-  const farewellSeconds = selectedPlan.durationSeconds <= 15 ? 3 : 6;
-
   return (
     <div className="relative z-10 min-h-[100dvh] pb-28">
       {/* Header */}
       <header className="sticky top-0 z-30 bg-[#0B0C10]/90 backdrop-blur-md border-b border-white/10">
-        <div className="max-w-5xl mx-auto px-4 sm:px-8 h-16 flex items-center justify-between gap-4">
+        <div className="max-w-5xl mx-auto px-4 sm:px-8 h-16 flex items-center justify-between gap-3">
           <button
             type="button"
             onClick={onBack}
@@ -124,21 +240,44 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
           >
             Área dos Pais · Personalizar Chamada
           </h1>
-          <div className="w-16" aria-hidden="true" />
+          {onOpenMyMagics ? (
+            <button
+              type="button"
+              onClick={onOpenMyMagics}
+              className="min-h-[38px] px-3 rounded-xl border border-[#D4AF37]/40 bg-[#13151C] text-xs font-semibold text-[#F5D97E] hover:bg-[#1B1E28] flex items-center gap-1.5 cursor-pointer shrink-0"
+            >
+              <FolderHeart className="w-3.5 h-3.5" aria-hidden="true" />
+              <span className="hidden sm:inline">Minhas magias</span>
+            </button>
+          ) : (
+            <div className="w-16" aria-hidden="true" />
+          )}
         </div>
       </header>
 
       <form onSubmit={handleStartCall} className="max-w-5xl mx-auto px-4 sm:px-8 py-8 space-y-10">
-        {(error || formError) && (
+        {(error || formError || checkoutNotice) && (
           <div
             role="alert"
-            className="rounded-2xl border border-red-400/40 bg-red-950/60 px-5 py-4 text-sm text-red-100"
+            className="rounded-2xl border border-amber-400/40 bg-amber-950/50 px-5 py-4 text-sm text-amber-100"
           >
-            {formError || error}
+            {formError || error || checkoutNotice}
           </div>
         )}
 
-        {/* Section 1: 4 Planos com Ancoragem (Passe Família Ilimitado) */}
+        {entitlementToken && paidPlanId && (
+          <div className="rounded-2xl border border-emerald-400/40 bg-emerald-950/35 px-5 py-3.5 flex flex-wrap items-center justify-between gap-2 text-sm text-emerald-100">
+            <span className="flex items-center gap-2 font-semibold">
+              <Check className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+              Pagamento confirmado · Plano liberado para usar!
+            </span>
+            <span className="text-xs text-emerald-300 uppercase tracking-wider font-semibold">
+              {PLANS.find((p) => p.id === paidPlanId)?.title || paidPlanId}
+            </span>
+          </div>
+        )}
+
+        {/* Section 1: 5 Planos com Checkout Asaas */}
         <section aria-labelledby="planos-heading" className="space-y-4">
           <div>
             <h2
@@ -149,7 +288,8 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
               1. Escolha o Plano da Ligação
             </h2>
             <p className="text-sm text-[#A8A396] mt-1">
-              Selecione a experiência ideal para sua família. O cronômetro segue o plano escolhido.
+              Selecione a experiência ideal para sua família. Clique em &ldquo;Selecionar
+              plano&rdquo; para abrir o pagamento seguro via Asaas.
             </p>
           </div>
 
@@ -158,11 +298,21 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
               const active = config.planId === plan.id;
               const isAnchoredBest = plan.id === 'familia';
               const isAudioIsca = plan.id === 'audio';
+              const unlocked = isPlanAuthorized(paidPlanId, entitlementToken, plan.id);
+              const asaasUrl = asaasLinks[plan.id];
+
               return (
-                <button
+                <div
                   key={plan.id}
-                  type="button"
+                  role="button"
+                  tabIndex={0}
                   onClick={() => updateField('planId', plan.id as PlanId)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault();
+                      updateField('planId', plan.id as PlanId);
+                    }
+                  }}
                   aria-pressed={active}
                   className={`text-left rounded-2xl p-5 border transition-all cursor-pointer flex flex-col justify-between gap-4 relative ${
                     isAnchoredBest
@@ -230,13 +380,39 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                     )}
                   </div>
 
-                  <div className="flex items-center justify-between pt-2 border-t border-white/8 text-xs">
+                  <div className="flex items-center justify-between gap-2 pt-2.5 border-t border-white/8 text-xs">
+                    {unlocked ? (
+                      <span className="inline-flex items-center gap-1.5 text-emerald-300 font-semibold">
+                        <Check className="w-4 h-4 text-emerald-400" aria-hidden="true" />
+                        Plano liberado
+                      </span>
+                    ) : isSafeHttpUrl(asaasUrl) ? (
+                      <a
+                        href={asaasUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        onClick={(e) => handleSelectPlanCheckout(plan.id, e)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-[#D4AF37] text-[#0B0C10] font-bold hover:bg-[#E5C454] transition-colors"
+                      >
+                        <span>Selecionar plano</span>
+                        <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+                      </a>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={(e) => handleSelectPlanCheckout(plan.id, e)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-[#D4AF37]/40 bg-[#1B1E28] text-[#F5D97E] font-semibold hover:bg-[#242836] cursor-pointer"
+                      >
+                        <CreditCard className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>Selecionar plano</span>
+                      </button>
+                    )}
+
                     <span className={active ? 'text-[#F5D97E] font-semibold' : 'text-[#8D887C]'}>
-                      {active ? 'Plano selecionado' : 'Selecionar plano'}
+                      {active ? 'Selecionado' : 'Editar detalhes'}
                     </span>
-                    {active && <Check className="w-4 h-4 text-[#D4AF37]" aria-hidden="true" />}
                   </div>
-                </button>
+                </div>
               );
             })}
           </div>
@@ -325,52 +501,53 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
         {/* Section 3: 4 Opções Criativas de Despedida (apenas planos de chamada de vídeo) */}
         {!isAudioPlan && (
           <section aria-labelledby="despedida-heading" className="space-y-4">
-          <div>
-            <h2
-              id="despedida-heading"
-              className="text-xl sm:text-2xl font-semibold text-[#F7F4EC]"
-              style={{fontFamily: 'var(--font-display)'}}
-            >
-              3. Despedida Mágica Automática (Últimos {farewellSeconds} segundos)
-            </h2>
-            <p className="text-sm text-[#A8A396] mt-1">
-              Escolha o motivo que o Papai Noel vai falar nos {farewellSeconds} segundos finais antes de desligar:
-            </p>
-          </div>
+            <div>
+              <h2
+                id="despedida-heading"
+                className="text-xl sm:text-2xl font-semibold text-[#F7F4EC]"
+                style={{fontFamily: 'var(--font-display)'}}
+              >
+                3. Despedida Mágica Automática (Últimos {farewellSeconds} segundos)
+              </h2>
+              <p className="text-sm text-[#A8A396] mt-1">
+                Escolha o motivo que o Papai Noel vai falar nos {farewellSeconds} segundos finais
+                antes de desligar:
+              </p>
+            </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {FAREWELL_OPTIONS.map((option) => {
-              const active = config.farewellType === option.id;
-              return (
-                <button
-                  key={option.id}
-                  type="button"
-                  onClick={() => updateField('farewellType', option.id)}
-                  aria-pressed={active}
-                  className={`text-left rounded-2xl p-5 border transition-all cursor-pointer flex items-start justify-between gap-4 ${
-                    active
-                      ? 'border-[#D4AF37] bg-[#191B24]'
-                      : 'border-white/10 bg-[#13151C] hover:border-white/25'
-                  }`}
-                >
-                  <div className="space-y-1">
-                    <span className="block text-base font-semibold text-[#F7F4EC]">
-                      {option.title}
-                    </span>
-                    <span className="block text-sm text-[#B5AFA2] leading-relaxed">
-                      {option.desc}
-                    </span>
-                  </div>
-                  <span
-                    className={`mt-1 w-5 h-5 rounded-full border flex items-center justify-center shrink-0 ${
-                      active ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0B0C10]' : 'border-white/30'
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              {FAREWELL_OPTIONS.map((option) => {
+                const active = config.farewellType === option.id;
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    onClick={() => updateField('farewellType', option.id)}
+                    aria-pressed={active}
+                    className={`text-left rounded-2xl p-5 border transition-all cursor-pointer flex items-start justify-between gap-4 ${
+                      active
+                        ? 'border-[#D4AF37] bg-[#191B24]'
+                        : 'border-white/10 bg-[#13151C] hover:border-white/25'
                     }`}
                   >
-                    {active && <Check className="w-3.5 h-3.5" strokeWidth={3} />}
-                  </span>
-                </button>
-              );
-            })}
+                    <div className="space-y-1">
+                      <span className="block text-base font-semibold text-[#F7F4EC]">
+                        {option.title}
+                      </span>
+                      <span className="block text-sm text-[#B5AFA2] leading-relaxed">
+                        {option.desc}
+                      </span>
+                    </div>
+                    <span
+                      className={`mt-1 w-5 h-5 rounded-full border flex items-center justify-center shrink-0 ${
+                        active ? 'border-[#D4AF37] bg-[#D4AF37] text-[#0B0C10]' : 'border-white/30'
+                      }`}
+                    >
+                      {active && <Check className="w-3.5 h-3.5" strokeWidth={3} />}
+                    </span>
+                  </button>
+                );
+              })}
             </div>
           </section>
         )}
@@ -390,8 +567,8 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                 4. E-mail para Envio do Link Mágico
               </h2>
               <p className="text-sm text-[#A8A396] mt-1">
-                Gere um link pronto para abrir a chamada personalizada em outro celular ou guardar por
-                e-mail.
+                Gere um link pronto (com selo de pagamento confirmado) para abrir a chamada
+                personalizada em outro celular.
               </p>
             </div>
 
@@ -477,7 +654,31 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                 {selectedPlan.priceLabel}
               </span>
             </div>
-            {isAudioPlan ? (
+
+            {!isSelectedPlanPaid ? (
+              isSafeHttpUrl(selectedAsaasUrl) ? (
+                <a
+                  href={selectedAsaasUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  onClick={(e) => handleSelectPlanCheckout(selectedPlan.id, e)}
+                  className="w-full sm:w-auto min-h-[52px] px-7 rounded-xl bg-[#D4AF37] text-[#0B0C10] font-bold text-base flex items-center justify-center gap-2.5 shadow-lg hover:bg-[#E5C454] active:scale-[0.98] transition-all"
+                >
+                  <Lock className="w-5 h-5" aria-hidden="true" />
+                  <span>Selecionar plano · Pagar {selectedPlan.priceLabel}</span>
+                  <ExternalLink className="w-4 h-4" aria-hidden="true" />
+                </a>
+              ) : (
+                <button
+                  type="button"
+                  onClick={(e) => handleSelectPlanCheckout(selectedPlan.id, e)}
+                  className="w-full sm:w-auto min-h-[52px] px-7 rounded-xl bg-[#D4AF37] text-[#0B0C10] font-bold text-base flex items-center justify-center gap-2.5 shadow-lg hover:bg-[#E5C454] active:scale-[0.98] transition-all cursor-pointer"
+                >
+                  <CreditCard className="w-5 h-5" aria-hidden="true" />
+                  <span>Selecionar plano · Pagar {selectedPlan.priceLabel}</span>
+                </button>
+              )
+            ) : isAudioPlan ? (
               <button
                 type="submit"
                 disabled={isGeneratingAudio}

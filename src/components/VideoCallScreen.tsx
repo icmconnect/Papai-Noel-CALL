@@ -70,6 +70,7 @@ async function fetchStaticBankClip(
 interface VideoCallScreenProps {
   config: CallConfig;
   preparedMedia: PreparedCallMedia | null;
+  entitlementToken?: string | null;
   isCallActive: boolean;
   isPreparingCall?: boolean;
   prepareError?: string | null;
@@ -156,6 +157,7 @@ function getFallbackFarewell(farewellType: CallConfig['farewellType'], childName
 export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   config,
   preparedMedia,
+  entitlementToken,
   isCallActive,
   isPreparingCall = false,
   prepareError = null,
@@ -180,6 +182,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   const [pipVideoState, setPipVideoState] = useState<'waiting' | 'playing' | 'ended'>('waiting');
   const [isPipTrackUnavailable, setIsPipTrackUnavailable] = useState<boolean>(true);
   const [greetingError, setGreetingError] = useState<string | null>(null);
+  const [isBgRetryingGreeting, setIsBgRetryingGreeting] = useState<boolean>(false);
   const [retryNonce, setRetryNonce] = useState<number>(0);
   const [isSpeechListening, setIsSpeechListening] = useState(false);
   const [isHoldingMic, setIsHoldingMic] = useState(false);
@@ -213,6 +216,8 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   const safetyEndTimeoutRef = useRef<number | null>(null);
   const helloTimeoutRef = useRef<number | null>(null);
   const greetingFallbackTimeoutRef = useRef<number | null>(null);
+  const bgGreetingRetryTimeoutRef = useRef<number | null>(null);
+  const bgRetryCountRef = useRef<number>(0);
   const genericGreetingAbortRef = useRef<AbortController | null>(null);
   const statusNoticeTimeoutRef = useRef<number | null>(null);
   const silentFarewellTimeoutRef = useRef<number | null>(null);
@@ -239,6 +244,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   );
   const prepareErrorRef = useRef<string | null>(prepareError ?? null);
   const callStartMsRef = useRef<number>(Date.now());
+  const pausedElapsedMsRef = useRef<number>(0);
   const lastCameraRequestAtRef = useRef<number>(0);
   const startWebSpeechListeningRef = useRef<() => void>(() => undefined);
 
@@ -451,6 +457,10 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     if (greetingFallbackTimeoutRef.current !== null) {
       window.clearTimeout(greetingFallbackTimeoutRef.current);
       greetingFallbackTimeoutRef.current = null;
+    }
+    if (bgGreetingRetryTimeoutRef.current !== null) {
+      window.clearTimeout(bgGreetingRetryTimeoutRef.current);
+      bgGreetingRetryTimeoutRef.current = null;
     }
     if (statusNoticeTimeoutRef.current !== null) {
       window.clearTimeout(statusNoticeTimeoutRef.current);
@@ -774,12 +784,16 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       try {
         const res = await fetch('/api/santa/farewell', {
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          headers: {
+            'Content-Type': 'application/json',
+            ...(entitlementToken ? {Authorization: `Bearer ${entitlementToken}`} : {}),
+          },
           signal: controller.signal,
           body: JSON.stringify({
             childName: config.childName,
             farewellType: config.farewellType,
             farewellText,
+            ...(entitlementToken ? {token: entitlementToken} : {}),
           }),
         });
         if (res.ok) {
@@ -863,6 +877,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     clearStatusNotice,
     config.childName,
     config.farewellType,
+    entitlementToken,
     finishCallSafely,
     setAudioPlayingState,
     showTemporaryNotice,
@@ -891,7 +906,10 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       try {
         const res = await fetch('/api/santa/reply', {
           method: 'POST',
-          headers: {'Content-Type': 'application/json'},
+          headers: {
+            'Content-Type': 'application/json',
+            ...(entitlementToken ? {Authorization: `Bearer ${entitlementToken}`} : {}),
+          },
           signal: controller.signal,
           body: JSON.stringify({
             ...payload,
@@ -900,6 +918,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
             praise: config.praise,
             advice: config.advice,
             history: historyRef.current,
+            ...(entitlementToken ? {token: entitlementToken} : {}),
           }),
         });
         if (!res.ok) {
@@ -1079,6 +1098,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       config.childAge,
       config.childName,
       config.praise,
+      entitlementToken,
       resetSpeechGate,
       scheduleAutoSpeechListening,
       setAudioPlayingState,
@@ -1185,6 +1205,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
 
   const pauseWallClockTimer = useCallback(() => {
     if (countdownIntervalRef.current !== null) {
+      pausedElapsedMsRef.current = Math.max(0, Date.now() - callStartMsRef.current);
       window.clearInterval(countdownIntervalRef.current);
       countdownIntervalRef.current = null;
     }
@@ -1444,6 +1465,9 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     }
 
     // Relógio wall-clock contínuo desde o momento em que a chamada é atendida
+    pausedElapsedMsRef.current = 0;
+    bgRetryCountRef.current = 0;
+    setIsBgRetryingGreeting(false);
     callStartMsRef.current = Date.now();
     startWallClockTimer();
 
@@ -1658,10 +1682,17 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       }
 
       if (countdownIntervalRef.current === null) {
-        callStartMsRef.current = Date.now();
+        callStartMsRef.current = Date.now() - pausedElapsedMsRef.current;
         startWallClockTimer();
       }
 
+      if (bgGreetingRetryTimeoutRef.current !== null) {
+        window.clearTimeout(bgGreetingRetryTimeoutRef.current);
+        bgGreetingRetryTimeoutRef.current = null;
+      }
+      bgRetryCountRef.current = 0;
+      setIsBgRetryingGreeting(false);
+      setGreetingError(null);
       clearStatusNotice();
       await playSantaAudio({
         audioBase64: greetingAudioBase64,
@@ -1707,6 +1738,52 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     syncConversationVideoByVolume,
   ]);
 
+  // Auto-retry em background após 15s enquanto o card de retry estiver visível (sem reiniciar a chamada)
+  useEffect(() => {
+    if (
+      !isCallActive ||
+      !greetingError ||
+      greetingStartedRef.current ||
+      farewellTriggeredRef.current ||
+      callEndedCalledRef.current ||
+      isPreparingCall ||
+      !onRetryGreeting
+    ) {
+      return;
+    }
+
+    if (bgRetryCountRef.current >= 4) {
+      return;
+    }
+
+    if (bgGreetingRetryTimeoutRef.current !== null) {
+      window.clearTimeout(bgGreetingRetryTimeoutRef.current);
+    }
+
+    bgGreetingRetryTimeoutRef.current = window.setTimeout(() => {
+      bgGreetingRetryTimeoutRef.current = null;
+      if (
+        !mountedRef.current ||
+        !isCallActive ||
+        greetingStartedRef.current ||
+        farewellTriggeredRef.current ||
+        callEndedCalledRef.current
+      ) {
+        return;
+      }
+      bgRetryCountRef.current += 1;
+      setIsBgRetryingGreeting(true);
+      onRetryGreeting();
+    }, 15000);
+
+    return () => {
+      if (bgGreetingRetryTimeoutRef.current !== null) {
+        window.clearTimeout(bgGreetingRetryTimeoutRef.current);
+        bgGreetingRetryTimeoutRef.current = null;
+      }
+    };
+  }, [greetingError, isCallActive, isPreparingCall, onRetryGreeting]);
+
   const handleRetryGreeting = useCallback(() => {
     cleanupAllDevices();
     helloStartedRef.current = false;
@@ -1717,6 +1794,9 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     farewellAudioFinishedRef.current = false;
     timerReachedZeroRef.current = false;
     callEndedCalledRef.current = false;
+    pausedElapsedMsRef.current = 0;
+    bgRetryCountRef.current = 0;
+    setIsBgRetryingGreeting(false);
     timeLeftRef.current = plan.durationSeconds;
     callPhaseRef.current = 'waiting-greeting';
     setCallPhase('waiting-greeting');
@@ -2193,12 +2273,17 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
                   Sinal instável no Polo Norte
                 </h3>
                 <p className="text-xs text-[#C7C2B6] leading-relaxed">{greetingError}</p>
+                <p className="text-[11px] text-[#F5D97E]">
+                  {isBgRetryingGreeting && isPreparingCall
+                    ? 'Reconectando automaticamente em segundo plano...'
+                    : 'Tentativa automática em segundo plano a cada 15s.'}
+                </p>
               </div>
               <div className="flex flex-col gap-2">
                 <button
                   type="button"
                   onClick={handleRetryGreeting}
-                  disabled={isPreparingCall}
+                  disabled={isPreparingCall && !isBgRetryingGreeting}
                   className="w-full min-h-[46px] px-4 rounded-xl bg-[#D4AF37] text-[#0B0C10] font-bold text-sm flex items-center justify-center gap-2 hover:bg-[#E5C454] active:scale-[0.98] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait"
                 >
                   {isPreparingCall ? (
