@@ -173,6 +173,12 @@ export default function App() {
   const talkingVideoRef = useRef<HTMLVideoElement | null>(null);
   const goodbyeVideoRef = useRef<HTMLVideoElement | null>(null);
   const countdownTimerRef = useRef<number | null>(null);
+  const screenRef = useRef<AppScreen>(screen);
+  const prepareRequestIdRef = useRef<number>(0);
+
+  useEffect(() => {
+    screenRef.current = screen;
+  }, [screen]);
 
   const handleConfigChange = (next: CallConfig) => {
     setConfig(next);
@@ -187,7 +193,38 @@ export default function App() {
     });
   }, []);
 
+  const requestFrontCameraStream = useCallback(async () => {
+    if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+      setFrontCameraStream(null);
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {facingMode: 'user'},
+        audio: false,
+      });
+      if (screenRef.current !== 'call') {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      setFrontCameraStream((prev) => {
+        if (prev && prev !== stream) {
+          prev.getTracks().forEach((t) => t.stop());
+        }
+        return stream;
+      });
+    } catch {
+      setFrontCameraStream((prev) => {
+        if (prev) {
+          prev.getTracks().forEach((t) => t.stop());
+        }
+        return null;
+      });
+    }
+  }, []);
+
   const prepareGreetingFromServer = useCallback(async (targetConfig: CallConfig) => {
+    const requestId = ++prepareRequestIdRef.current;
     setIsPreparingCall(true);
     setPrepareError(null);
     setPreparedMedia(null);
@@ -202,15 +239,23 @@ export default function App() {
       if (!res.ok) {
         throw new Error(data.error || 'Erro ao preparar a fala do Papai Noel.');
       }
+      if (requestId !== prepareRequestIdRef.current) {
+        return null;
+      }
       setPreparedMedia(data as PreparedCallMedia);
       return data as PreparedCallMedia;
     } catch (err) {
+      if (requestId !== prepareRequestIdRef.current) {
+        return null;
+      }
       const msg =
         err instanceof Error ? err.message : 'Não foi possível conectar ao Polo Norte.';
       setPrepareError(msg);
       return null;
     } finally {
-      setIsPreparingCall(false);
+      if (requestId === prepareRequestIdRef.current) {
+        setIsPreparingCall(false);
+      }
     }
   }, []);
 
@@ -279,30 +324,21 @@ export default function App() {
       }
     });
 
+    screenRef.current = 'call';
     setScreen('call');
 
-    if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-      navigator.mediaDevices
-        .getUserMedia({
-          video: {facingMode: 'user'},
-          audio: false,
-        })
-        .then((stream) => {
-          setFrontCameraStream(stream);
-        })
-        .catch(() => {
-          setFrontCameraStream(null);
-        });
-    }
+    void requestFrontCameraStream();
   };
 
   const handleDeclineIncomingCall = () => {
+    screenRef.current = 'home';
     stopCurrentSantaVoice();
     stopCameraStream();
     setScreen('home');
   };
 
   const handleCallEnded = useCallback(() => {
+    screenRef.current = 'ended';
     stopCurrentSantaVoice();
     stopCameraStream();
     setScreen('ended');
@@ -417,6 +453,12 @@ export default function App() {
           config={config}
           preparedMedia={preparedMedia}
           isCallActive={screen === 'call'}
+          isPreparingCall={isPreparingCall}
+          prepareError={prepareError}
+          onRetryGreeting={() => {
+            void prepareGreetingFromServer(config);
+          }}
+          onRequestCameraStream={requestFrontCameraStream}
           helloVideoRef={helloVideoRef}
           listeningVideoRef={listeningVideoRef}
           talkingVideoRef={talkingVideoRef}

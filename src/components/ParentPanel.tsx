@@ -1,4 +1,4 @@
-import React, {useState} from 'react';
+import React, {useEffect, useState} from 'react';
 import {ArrowLeft, Check, Copy, Mail, PhoneCall, Send, Sparkles} from 'lucide-react';
 import {CallConfig, FAREWELL_OPTIONS, PLANS, PlanId} from '../types';
 
@@ -22,6 +22,22 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
   const [linkError, setLinkError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  const [ctaCountdown, setCtaCountdown] = useState<number>(10);
+
+  useEffect(() => {
+    setCtaCountdown(10);
+    const deadlineMs = Date.now() + 10000;
+    const timer = window.setInterval(() => {
+      const remaining = Math.max(0, Math.ceil((deadlineMs - Date.now()) / 1000));
+      setCtaCountdown(remaining);
+      if (remaining <= 0) {
+        window.clearInterval(timer);
+      }
+    }, 250);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, []);
 
   const updateField = <K extends keyof CallConfig>(key: K, value: CallConfig[K]) => {
     onChange({...config, [key]: value});
@@ -78,6 +94,7 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
   };
 
   const selectedPlan = PLANS.find((p) => p.id === config.planId) || PLANS[3];
+  const farewellSeconds = selectedPlan.durationSeconds <= 15 ? 3 : 6;
 
   return (
     <div className="relative z-10 min-h-[100dvh] pb-28">
@@ -281,10 +298,10 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
               className="text-xl sm:text-2xl font-semibold text-[#F7F4EC]"
               style={{fontFamily: 'var(--font-display)'}}
             >
-              3. Despedida Mágica Automática (Últimos 6 segundos)
+              3. Despedida Mágica Automática (Últimos {farewellSeconds} segundos)
             </h2>
             <p className="text-sm text-[#A8A396] mt-1">
-              Escolha o motivo que o Papai Noel vai falar nos 6 segundos finais antes de desligar:
+              Escolha o motivo que o Papai Noel vai falar nos {farewellSeconds} segundos finais antes de desligar:
             </p>
           </div>
 
@@ -425,10 +442,15 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
             </div>
             <button
               type="submit"
-              className="w-full sm:w-auto min-h-[52px] px-7 rounded-xl bg-[#D4AF37] text-[#0B0C10] font-bold text-base flex items-center justify-center gap-2.5 shadow-lg hover:bg-[#E5C454] active:scale-[0.98] transition-all cursor-pointer"
+              disabled={ctaCountdown > 0}
+              className="w-full sm:w-auto min-h-[52px] px-7 rounded-xl bg-[#D4AF37] text-[#0B0C10] font-bold text-base flex items-center justify-center gap-2.5 shadow-lg hover:bg-[#E5C454] active:scale-[0.98] transition-all cursor-pointer disabled:opacity-55 disabled:cursor-not-allowed disabled:hover:bg-[#D4AF37] tabular-nums"
             >
               <PhoneCall className="w-5 h-5" aria-hidden="true" />
-              <span>Iniciar Ligação em 10 segundos</span>
+              <span>
+                {ctaCountdown > 0
+                  ? `Iniciar Ligação em ${ctaCountdown}s`
+                  : 'Iniciar Ligação Agora'}
+              </span>
             </button>
           </div>
         </div>
