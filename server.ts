@@ -34,6 +34,11 @@ interface CachedGreeting {
   greetingText: string;
   greetingAudioBase64: string | null;
   greetingAudioMimeType: string | null;
+  bridgeText: string;
+  bridgeAudioBase64: string | null;
+  bridgeAudioMimeType: string | null;
+  bridgeUseBrowserFallback: boolean;
+  bridgeVoiceSource: string;
   farewellText: string;
   farewellAudioBase64: string | null;
   farewellAudioMimeType: string | null;
@@ -43,6 +48,14 @@ interface CachedGreeting {
   voiceSource: string;
   ttsError: string | null;
   unsupportedFieldError?: string | null;
+}
+
+interface CachedBridge {
+  bridgeText: string;
+  bridgeAudioBase64: string | null;
+  bridgeAudioMimeType: string | null;
+  useBrowserFallback: boolean;
+  voiceSource: string;
 }
 
 interface CachedFarewell {
@@ -56,6 +69,7 @@ interface CachedFarewell {
 
 const MAX_CACHE_ENTRIES = 100;
 const greetingCache = new Map<string, CachedGreeting>();
+const bridgeCache = new Map<string, CachedBridge>();
 const farewellCache = new Map<string, CachedFarewell>();
 const audioBank = new Map<string, {audioBase64: string; audioMimeType: string; text: string}>();
 
@@ -870,17 +884,23 @@ function getFarewellDirective(farewellType: FarewellType): string {
 
 function getFarewellScript(farewellType: FarewellType, childName: string): string {
   const safeName = childName.trim() || 'meu bem';
+  let raw = '';
   switch (farewellType) {
     case 'mamae':
-      return `${safeName}, a Mamãe Noel está me chamando para o leite quentinho... Feliz Natal!`;
+      raw = `${safeName}, a Mamãe Noel chamou para o leite quentinho... Feliz Natal!`;
+      break;
     case 'renas':
-      return `${safeName}, o Rodolfo já está chamando porque o trenó vai decolar... Feliz Natal!`;
+      raw = `${safeName}, o Rodolfo chamou e o trenó vai decolar... Feliz Natal!`;
+      break;
     case 'carta':
-      return `${safeName}, chegou uma pilha mágica de cartas urgentes no Polo Norte... Feliz Natal!`;
+      raw = `${safeName}, chegou uma carta urgente no Polo Norte... Feliz Natal!`;
+      break;
     case 'duendes':
     default:
-      return `${safeName}, os duendes estão aprontando na fábrica de brinquedos, preciso correr... Feliz Natal!`;
+      raw = `${safeName}, os duendes estão aprontando na fábrica... Feliz Natal!`;
+      break;
   }
+  return prepareSantaSpeechScript(raw, 90);
 }
 
 function normalizeFarewellType(raw: string | undefined): FarewellType {
@@ -893,24 +913,77 @@ function normalizeFarewellType(raw: string | undefined): FarewellType {
 function buildFallbackGreeting(
   planId: PlanId,
   childName: string,
-  praise: string,
-  advice: string
+  praise: string
 ): string {
   const cleanPraise = prepareSantaSpeechScript(praise, 90).replace(/[.!?…]+$/g, '');
-  const cleanAdvice = prepareSantaSpeechScript(advice, 90).replace(/[.!?…]+$/g, '');
   const base = `Olá, ${childName}! Que alegria enorme ver você aqui na nossa chamada do Polo Norte...`;
   if (planId === '15s') {
-    return `Olá, ${childName}! Você está na minha Lista dos Bonzinhos deste ano... que orgulho!`;
+    return prepareSantaSpeechScript(
+      `Olá, ${childName}! Você está na minha Lista dos Bonzinhos deste ano... que orgulho!`,
+      180
+    );
   }
   const praisePart = cleanPraise ? ` Soube que você mandou muito bem, ${cleanPraise}.` : '';
-  const advicePart = cleanAdvice ? ` Lembre-se sempre de ${cleanAdvice}.` : '';
   if (planId === '30s') {
-    return prepareSantaSpeechScript(`${base}${praisePart}${advicePart}`, 180);
+    return prepareSantaSpeechScript(`${base}${praisePart}`, 180);
   }
   return prepareSantaSpeechScript(
-    `${base}${praisePart} Me conta... o que você mais quer fazer neste Natal?`,
+    `${base}${praisePart} Me conta... como foi o seu dia hoje?`,
     180
   );
+}
+
+function buildFallbackBridge(childName: string, advice: string): string {
+  const cleanAdvice = prepareSantaSpeechScript(advice, 90).replace(/[.!?…]+$/g, '');
+  if (cleanAdvice) {
+    return prepareSantaSpeechScript(
+      `Lembre-se sempre de ${cleanAdvice}... e me conta, ${childName}, qual presente você mais quer neste Natal?`,
+      180
+    );
+  }
+  return prepareSantaSpeechScript(
+    `${childName}, continue sendo essa criança tão especial... qual presente você mais quer ganhar neste Natal?`,
+    180
+  );
+}
+
+function normalizeCompareText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildReplyFallbackPool(childName: string): string[] {
+  const safeName = childName.trim() || 'meu bem';
+  return [
+    `Que maravilha, ${safeName}... me conta o que você mais gostou de fazer hoje!`,
+    `Ah, que alegria ouvir isso, ${safeName}... você já escreveu sua cartinha de Natal?`,
+    `Os duendes vão adorar saber disso, ${safeName}! Qual brincadeira você mais ama?`,
+    `O trenó até brilhou aqui no Polo Norte, ${safeName}... qual seu maior sonho neste Natal?`,
+    `Que orgulho de você, ${safeName}! Já ajudou alguém especial essa semana?`,
+    `O Rodolfo balançou os guizos de alegria, ${safeName}... quer me contar mais um segredo?`,
+  ];
+}
+
+function pickNonRepeatingReplyFallback(childName: string, history: ChatTurn[]): string {
+  const pool = buildReplyFallbackPool(childName);
+  const lastSantaText = [...history].reverse().find((t) => t.role === 'santa')?.text || '';
+  const lastNormalized = normalizeCompareText(lastSantaText);
+  const lastPrefix = lastNormalized.slice(0, 28);
+
+  const nonRepeating = pool.filter((candidate) => {
+    const candNorm = normalizeCompareText(candidate);
+    if (!lastNormalized) return true;
+    return candNorm !== lastNormalized && (!lastPrefix || !candNorm.startsWith(lastPrefix));
+  });
+
+  const choices = nonRepeating.length > 0 ? nonRepeating : pool;
+  const idx = Math.floor(Math.random() * choices.length);
+  return prepareSantaSpeechScript(choices[idx], 160);
 }
 
 function resolvePublicBaseUrl(req: Request): string {
@@ -1403,26 +1476,38 @@ async function startServer() {
       const planId: PlanId = body.planId || '30s';
       const farewellType = normalizeFarewellType(body.farewellType);
 
+      const isQuick15sPlan = planId === '15s';
       const audioBankKey = `${planId}:${childName.toLowerCase()}:${childAge}:${praise}:${advice}`;
       const cacheKey = `${audioBankKey}:${farewellType}`;
 
       const cached = greetingCache.get(cacheKey);
-      if (cached && cached.greetingAudioBase64 && cached.farewellAudioBase64) {
+      if (
+        cached &&
+        cached.greetingAudioBase64 &&
+        cached.farewellAudioBase64 &&
+        (isQuick15sPlan || cached.bridgeAudioBase64)
+      ) {
         res.json(cached);
         return;
       }
 
       let planDirective = '';
-      if (planId === '15s') {
+      if (isQuick15sPlan) {
         planDirective =
           'Gere UMA fala bem curtinha (1 frase, máximo 16 palavras) chamando pelo nome, com alegria natalina, dizendo que está na lista dos bonzinhos.';
       } else if (planId === '30s') {
         planDirective =
-          'Gere UMA fala calorosa e alegre (máximo 2 frases curtas, 20 a 30 palavras) chamando pelo nome, elogiando o que fez de bom e dando o conselho dos pais com carinho.';
+          'Gere UMA fala calorosa e alegre (máximo 2 frases curtas, 16 a 24 palavras) chamando pelo nome e elogiando o que ela fez de bom (NÃO inclua o conselho nem pergunta do presente aqui, eles vão no bridgeText).';
       } else {
         planDirective =
-          'Gere UMA abertura alegre e mágica (máximo 2 frases curtas, 18 a 26 palavras) chamando pelo nome, citando o elogio e fazendo UMA pergunta curta e empolgante para a criança responder.';
+          'Gere UMA abertura alegre e mágica (máximo 2 frases curtas, 16 a 24 palavras) chamando pelo nome, citando o elogio e fazendo UMA pergunta curta inicial para a criança responder.';
       }
+
+      const bridgeDirective = isQuick15sPlan
+        ? 'Para plano de 15s, retorne bridgeText como string vazia "".'
+        : `Instruções para bridgeText (ATO 2 — conselho + pergunta do presente, APENAS fala direta para a criança):
+- Integre com carinho o conselho dos pais${advice ? ` ("${advice}")` : ' (incentivo gentil)'} e faça UMA pergunta calorosa sobre qual presente ${childName} mais quer ganhar neste Natal.
+- Use 1 ou 2 frases curtas (máximo 24 palavras) e reticências "..." para pausa natural. NUNCA escreva "Ho ho ho" nem rótulos.`;
 
       const prompt = `Você é o verdadeiro Papai Noel brasileiro em uma chamada de vídeo ao vivo com uma criança querida.
 Informações da família (NUNCA repita rótulos como "Nome:" ou "Elogio:", integre naturalmente na fala):
@@ -1431,19 +1516,22 @@ ${childAge ? `- Idade: ${childAge} anos` : ''}
 ${praise ? `- Algo bom que ela fez: ${praise}` : ''}
 ${advice ? `- Conselho carinhoso dos pais: ${advice}` : ''}
 
-Instruções para greetingText (APENAS a fala direta para a criança ouvir):
+Instruções para greetingText (ATO 1 — APENAS a fala direta para a criança ouvir):
 - Escreva em português do Brasil natural, com sorriso na voz, entusiasmo natalino genuíno, calor humano e ritmo acolhedor.
 - NUNCA escreva "Ho ho ho" ou "Ho, ho, ho" (o riso será gerado por tag sonora). Comece com saudação calorosa como "Olá, ${childName}! Que alegria ver você...".
 - Use pontuação expressiva natural (reticências "..." para pausas afetivas, vírgulas leves, pontos e no máximo 1 ponto de exclamação onde fizer sentido).
 - ${planDirective}
 - NUNCA inclua instruções, colchetes, parênteses, aspas, asteriscos ou rótulos de formulário.
 
-Instruções para farewellText (despedida final curta — APENAS a fala direta):
+${bridgeDirective}
+
+Instruções para farewellText (ATO 3 — despedida final curta, NO MÁXIMO 90 caracteres):
 - Motivo da despedida: ${getFarewellDirective(farewellType)}
 - NUNCA escreva "Ho ho ho", colchetes, rótulos ou metadados.
-- Gere uma despedida animada, carinhosa e curta (1 ou 2 frases, máximo 18 palavras) citando ${childName} e desejando Feliz Natal!`;
+- Gere uma despedida animada, carinhosa e curta (máximo 12 palavras e OBRIGATORIAMENTE até 90 caracteres) citando ${childName} e desejando Feliz Natal!`;
 
-      let greetingText = buildFallbackGreeting(planId, childName, praise, advice);
+      let greetingText = buildFallbackGreeting(planId, childName, praise);
+      let bridgeText = isQuick15sPlan ? '' : buildFallbackBridge(childName, advice);
       let farewellText = getFarewellScript(farewellType, childName);
 
       try {
@@ -1455,21 +1543,26 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
               type: Type.OBJECT,
               properties: {
                 greetingText: {type: Type.STRING},
+                bridgeText: {type: Type.STRING},
                 farewellText: {type: Type.STRING},
               },
-              required: ['greetingText', 'farewellText'],
+              required: ['greetingText', 'bridgeText', 'farewellText'],
             },
           });
 
           const parsed = JSON.parse((textResult.text || '{}').trim()) as {
             greetingText?: string;
+            bridgeText?: string;
             farewellText?: string;
           };
           if (parsed.greetingText?.trim()) {
             greetingText = prepareSantaSpeechScript(parsed.greetingText, 180) || greetingText;
           }
+          if (!isQuick15sPlan && parsed.bridgeText?.trim()) {
+            bridgeText = prepareSantaSpeechScript(parsed.bridgeText, 180) || bridgeText;
+          }
           if (parsed.farewellText?.trim()) {
-            farewellText = prepareSantaSpeechScript(parsed.farewellText, 180) || farewellText;
+            farewellText = prepareSantaSpeechScript(parsed.farewellText, 90) || farewellText;
           }
         }
       } catch (err) {
@@ -1534,6 +1627,40 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
         };
       };
 
+      const bridgeCacheKey = `${planId}|${childName.toLowerCase()}|${advice}|${bridgeText}`;
+      const resolveBridgeAudio = async (): Promise<CachedBridge> => {
+        if (isQuick15sPlan || !bridgeText) {
+          return {
+            bridgeText: '',
+            bridgeAudioBase64: null,
+            bridgeAudioMimeType: null,
+            useBrowserFallback: false,
+            voiceSource: 'none',
+          };
+        }
+        const cachedBridge = bridgeCache.get(bridgeCacheKey);
+        if (cachedBridge && cachedBridge.bridgeAudioBase64) {
+          return cachedBridge;
+        }
+        const synthBridge = await synthesizeSantaVoice(
+          bridgeText,
+          undefined,
+          undefined,
+          routeAbortController.signal
+        );
+        const result: CachedBridge = {
+          bridgeText,
+          bridgeAudioBase64: synthBridge.audioBase64,
+          bridgeAudioMimeType: synthBridge.audioMimeType,
+          useBrowserFallback: synthBridge.useBrowserFallback,
+          voiceSource: synthBridge.voiceSource,
+        };
+        if (result.bridgeAudioBase64 && !routeAbortController.signal.aborted) {
+          setLimitedCache(bridgeCache, bridgeCacheKey, result);
+        }
+        return result;
+      };
+
       const farewellCacheKey = `${farewellType}|${childName.toLowerCase()}|${farewellText}`;
       const resolveFarewellAudio = async (): Promise<CachedFarewell> => {
         const cachedFarewell = farewellCache.get(farewellCacheKey);
@@ -1560,8 +1687,9 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
         return result;
       };
 
-      const [greetingAudio, farewellAudioPayload] = await Promise.all([
+      const [greetingAudio, bridgeAudioPayload, farewellAudioPayload] = await Promise.all([
         resolveGreetingAudio(),
+        resolveBridgeAudio(),
         resolveFarewellAudio(),
       ]);
 
@@ -1577,6 +1705,11 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
         greetingText,
         greetingAudioBase64: greetingAudio.audioBase64,
         greetingAudioMimeType: greetingAudio.audioMimeType,
+        bridgeText: bridgeAudioPayload.bridgeText,
+        bridgeAudioBase64: bridgeAudioPayload.bridgeAudioBase64,
+        bridgeAudioMimeType: bridgeAudioPayload.bridgeAudioMimeType,
+        bridgeUseBrowserFallback: bridgeAudioPayload.useBrowserFallback,
+        bridgeVoiceSource: bridgeAudioPayload.voiceSource,
         farewellText,
         farewellAudioBase64: farewellAudioPayload.farewellAudioBase64,
         farewellAudioMimeType: farewellAudioPayload.farewellAudioMimeType,
@@ -1590,7 +1723,11 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
           : {}),
       };
 
-      if (payload.greetingAudioBase64 && payload.farewellAudioBase64) {
+      if (
+        payload.greetingAudioBase64 &&
+        payload.farewellAudioBase64 &&
+        (isQuick15sPlan || payload.bridgeAudioBase64)
+      ) {
         setLimitedCache(greetingCache, cacheKey, payload);
       }
 
@@ -1621,7 +1758,8 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
       const rawFarewell =
         (typeof body.farewellText === 'string' ? body.farewellText.trim() : '') ||
         getFarewellScript(farewellType, childName);
-      const farewellText = sanitizeTextForSantaTts(rawFarewell) || getFarewellScript(farewellType, childName);
+      const farewellText =
+        prepareSantaSpeechScript(rawFarewell, 90) || getFarewellScript(farewellType, childName);
 
       const cacheKey = `${farewellType}|${childName.toLowerCase()}|${farewellText}`;
       const cached = farewellCache.get(cacheKey);
@@ -1784,6 +1922,7 @@ Instruções para farewellText (despedida final curta — APENAS a fala direta):
         .map((turn) => `${turn.role === 'santa' ? 'Papai Noel' : childName}: ${turn.text}`)
         .join('\n');
 
+      const lastSantaTurn = [...history].reverse().find((t) => t.role === 'santa')?.text || '';
       const replyPrompt = `Você é o verdadeiro Papai Noel brasileiro em chamada de vídeo ao vivo com ${childName}${
         childAge ? ` (${childAge} anos)` : ''
       }.
@@ -1793,11 +1932,12 @@ A criança acabou de dizer: "${effectiveTranscript}"
 
 REGRAS OBRIGATÓRIAS:
 - NUNCA escreva "Ho ho ho" ou "Ho, ho, ho" no texto.
+- PROIBIDO repetir a última frase do Papai Noel no histórico${lastSantaTurn ? ` ("${lastSantaTurn}")` : ''}.
 - Responda em NO MÁXIMO 14 palavras em português brasileiro alegre, carinhoso, acolhedor e com entusiasmo natalino natural.
 - Use reticências "..." quando quiser pausa suave e pontuação expressiva natural (sem excesso de "!").
 - Retorne APENAS a fala direta para a criança ouvir, sem instruções, aspas, colchetes ou asteriscos.`;
 
-      let replyText = `Que maravilha, ${childName}! Me conte mais sobre isso...`;
+      let replyText = pickNonRepeatingReplyFallback(childName, history);
       try {
         const replyResult = await generateSantaText({
           contents: replyPrompt,
@@ -1806,7 +1946,14 @@ REGRAS OBRIGATÓRIAS:
           externalSignal: routeAbortController.signal,
         });
         if (replyResult && replyResult.text?.trim()) {
-          replyText = prepareSantaSpeechScript(replyResult.text, 160) || replyText;
+          const candidate = prepareSantaSpeechScript(replyResult.text, 160);
+          if (
+            candidate &&
+            (!lastSantaTurn ||
+              normalizeCompareText(candidate) !== normalizeCompareText(lastSantaTurn))
+          ) {
+            replyText = candidate;
+          }
         }
       } catch (err) {
         if (routeAbortController.signal.aborted || isAbortError(err)) {

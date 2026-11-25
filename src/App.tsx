@@ -80,7 +80,8 @@ export default function App() {
             audioBase64: data.audioBase64,
             audioMimeType: data.audioMimeType,
             fallbackText: data.text || '',
-            useBrowserFallback: data.useBrowserFallback,
+            useBrowserFallback: false,
+            disableBrowserFallback: true,
           });
         }
       } catch (err) {
@@ -167,6 +168,7 @@ export default function App() {
   const [prepareError, setPrepareError] = useState<string | null>(null);
   const [frontCameraStream, setFrontCameraStream] = useState<MediaStream | null>(null);
 
+  const helloVideoRef = useRef<HTMLVideoElement | null>(null);
   const listeningVideoRef = useRef<HTMLVideoElement | null>(null);
   const talkingVideoRef = useRef<HTMLVideoElement | null>(null);
   const goodbyeVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -265,6 +267,7 @@ export default function App() {
     unlockAudioContext();
 
     [
+      helloVideoRef.current,
       listeningVideoRef.current,
       talkingVideoRef.current,
       goodbyeVideoRef.current,
@@ -337,6 +340,7 @@ export default function App() {
           aria-hidden="true"
           className="fixed w-px h-px opacity-0 pointer-events-none overflow-hidden -z-10"
         >
+          <video src="/videos/santa-hello.mp4" preload="auto" muted playsInline />
           <video src="/videos/santa-listening.mp4" preload="auto" muted playsInline />
           <video src="/videos/santa-talking.mp4" preload="auto" muted playsInline />
           <video src="/videos/santa-goodbye.mp4" preload="auto" muted playsInline />
@@ -413,6 +417,7 @@ export default function App() {
           config={config}
           preparedMedia={preparedMedia}
           isCallActive={screen === 'call'}
+          helloVideoRef={helloVideoRef}
           listeningVideoRef={listeningVideoRef}
           talkingVideoRef={talkingVideoRef}
           goodbyeVideoRef={goodbyeVideoRef}
