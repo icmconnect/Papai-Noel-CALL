@@ -1,5 +1,5 @@
 import React, {useEffect, useState} from 'react';
-import {ArrowLeft, Check, Copy, Mail, PhoneCall, Send, Sparkles} from 'lucide-react';
+import {ArrowLeft, Check, Copy, Loader2, Mail, PhoneCall, Send, Sparkles, Volume2} from 'lucide-react';
 import {CallConfig, FAREWELL_OPTIONS, PLANS, PlanId} from '../types';
 
 interface ParentPanelProps {
@@ -7,6 +7,8 @@ interface ParentPanelProps {
   onChange: (next: CallConfig) => void;
   onBack: () => void;
   onStartCountdown: () => void;
+  onGenerateAudioMagic?: () => void;
+  isGeneratingAudio?: boolean;
   error: string | null;
 }
 
@@ -15,6 +17,8 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
   onChange,
   onBack,
   onStartCountdown,
+  onGenerateAudioMagic,
+  isGeneratingAudio = false,
   error,
 }) => {
   const [magicLink, setMagicLink] = useState<string | null>(null);
@@ -90,10 +94,15 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
       return;
     }
     setFormError(null);
+    if (config.planId === 'audio' && onGenerateAudioMagic) {
+      onGenerateAudioMagic();
+      return;
+    }
     onStartCountdown();
   };
 
   const selectedPlan = PLANS.find((p) => p.id === config.planId) || PLANS[3];
+  const isAudioPlan = selectedPlan.id === 'audio';
   const farewellSeconds = selectedPlan.durationSeconds <= 15 ? 3 : 6;
 
   return (
@@ -148,6 +157,7 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
             {PLANS.map((plan) => {
               const active = config.planId === plan.id;
               const isAnchoredBest = plan.id === 'familia';
+              const isAudioIsca = plan.id === 'audio';
               return (
                 <button
                   key={plan.id}
@@ -159,21 +169,37 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                       ? active
                         ? 'border-[#D4AF37] bg-gradient-to-br from-[#231D0F] via-[#191B24] to-[#13151C] shadow-[0_0_0_2px_rgba(212,175,55,0.55)]'
                         : 'border-[#D4AF37]/60 bg-gradient-to-br from-[#1C1810] to-[#13151C] hover:border-[#D4AF37]'
-                      : active
-                        ? 'border-[#D4AF37] bg-[#191B24] shadow-[0_0_0_1px_rgba(212,175,55,0.4)]'
-                        : 'border-white/10 bg-[#13151C] hover:border-white/25'
+                      : isAudioIsca
+                        ? active
+                          ? 'border-emerald-400 bg-gradient-to-br from-[#0F231C] via-[#191B24] to-[#13151C] shadow-[0_0_0_2px_rgba(52,211,153,0.45)] md:col-span-2'
+                          : 'border-emerald-500/45 bg-gradient-to-br from-[#0E1B16] to-[#13151C] hover:border-emerald-400 md:col-span-2'
+                        : active
+                          ? 'border-[#D4AF37] bg-[#191B24] shadow-[0_0_0_1px_rgba(212,175,55,0.4)]'
+                          : 'border-white/10 bg-[#13151C] hover:border-white/25'
                   }`}
                 >
                   <div className="space-y-2.5">
-                    {isAnchoredBest && (
+                    {(isAnchoredBest || isAudioIsca) && plan.badge && (
                       <div className="flex flex-wrap items-center justify-between gap-2 pb-1">
-                        <span className="inline-flex items-center gap-1.5 text-[11px] font-bold tracking-wider uppercase text-[#0B0C10] bg-[#D4AF37] px-2.5 py-1 rounded-md">
+                        <span
+                          className={`inline-flex items-center gap-1.5 text-[11px] font-bold tracking-wider uppercase px-2.5 py-1 rounded-md ${
+                            isAudioIsca
+                              ? 'text-[#0B0C10] bg-emerald-400'
+                              : 'text-[#0B0C10] bg-[#D4AF37]'
+                          }`}
+                        >
                           <Sparkles className="w-3 h-3" aria-hidden="true" />
                           {plan.badge}
                         </span>
-                        <span className="text-[11px] font-semibold tracking-wider uppercase text-[#F5D97E]">
-                          {plan.topTag}
-                        </span>
+                        {plan.topTag && (
+                          <span
+                            className={`text-[11px] font-semibold tracking-wider uppercase ${
+                              isAudioIsca ? 'text-emerald-300' : 'text-[#F5D97E]'
+                            }`}
+                          >
+                            {plan.topTag}
+                          </span>
+                        )}
                       </div>
                     )}
 
@@ -181,7 +207,13 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                       <span className="text-base sm:text-lg font-semibold text-[#F7F4EC]">
                         {plan.title}{' '}
                         <span className="text-sm font-normal text-[#B5AFA2]">
-                          ({plan.id === 'familia' ? '60s por chamada' : `${plan.durationSeconds}s`})
+                          (
+                          {plan.id === 'familia'
+                            ? '60s por chamada'
+                            : plan.id === 'audio'
+                              ? 'Só Áudio'
+                              : `${plan.durationSeconds}s`}
+                          )
                         </span>
                       </span>
                       <span className="text-lg font-bold text-[#F5D97E] tabular-nums shrink-0">
@@ -290,8 +322,9 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
           </div>
         </section>
 
-        {/* Section 3: 4 Opções Criativas de Despedida */}
-        <section aria-labelledby="despedida-heading" className="space-y-4">
+        {/* Section 3: 4 Opções Criativas de Despedida (apenas planos de chamada de vídeo) */}
+        {!isAudioPlan && (
+          <section aria-labelledby="despedida-heading" className="space-y-4">
           <div>
             <h2
               id="despedida-heading"
@@ -338,120 +371,144 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                 </button>
               );
             })}
-          </div>
-        </section>
-
-        {/* Section 4: E-mail & Link Mágico */}
-        <section
-          aria-labelledby="email-heading"
-          className="rounded-2xl border border-white/10 bg-[#13151C] p-5 sm:p-6 space-y-4"
-        >
-          <div>
-            <h2
-              id="email-heading"
-              className="text-lg font-semibold text-[#F7F4EC]"
-              style={{fontFamily: 'var(--font-display)'}}
-            >
-              4. E-mail para Envio do Link Mágico
-            </h2>
-            <p className="text-sm text-[#A8A396] mt-1">
-              Gere um link pronto para abrir a chamada personalizada em outro celular ou guardar por
-              e-mail.
-            </p>
-          </div>
-
-          <div className="flex flex-col sm:flex-row gap-3">
-            <div className="relative flex-1">
-              <Mail
-                className="w-4 h-4 text-[#9CA3AF] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none"
-                aria-hidden="true"
-              />
-              <input
-                type="email"
-                value={config.parentEmail}
-                onChange={(e) => updateField('parentEmail', e.target.value)}
-                placeholder="seuemail@exemplo.com"
-                className="w-full min-h-[48px] pl-11 pr-4 rounded-xl bg-[#0B0C10] border border-white/15 text-sm text-white placeholder:text-[#6B7280] focus:outline-none focus:border-[#D4AF37]"
-              />
             </div>
+          </section>
+        )}
 
-            <button
-              type="button"
-              onClick={handleGenerateMagicLink}
-              disabled={isSendingLink}
-              className="min-h-[48px] px-5 rounded-xl border border-[#D4AF37]/50 bg-[#1B1E28] text-sm font-semibold text-[#F5D97E] hover:bg-[#242836] transition-colors flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer disabled:opacity-60"
-            >
-              <Send className="w-4 h-4" aria-hidden="true" />
-              <span>{isSendingLink ? 'Gerando...' : 'Gerar Link Mágico'}</span>
-            </button>
-          </div>
-
-          {linkError && <p className="text-xs text-red-400">{linkError}</p>}
-
-          {magicLink && (
-            <div className="rounded-xl bg-[#0B0C10] border border-[#D4AF37]/30 p-4 space-y-3">
-              <p className="text-xs text-[#D4AF37] font-medium">
-                Link mágico criado com sucesso
-                {config.parentEmail ? ` para ${config.parentEmail}` : ''}:
+        {/* Section 4: E-mail & Link Mágico (apenas planos de chamada de vídeo) */}
+        {!isAudioPlan && (
+          <section
+            aria-labelledby="email-heading"
+            className="rounded-2xl border border-white/10 bg-[#13151C] p-5 sm:p-6 space-y-4"
+          >
+            <div>
+              <h2
+                id="email-heading"
+                className="text-lg font-semibold text-[#F7F4EC]"
+                style={{fontFamily: 'var(--font-display)'}}
+              >
+                4. E-mail para Envio do Link Mágico
+              </h2>
+              <p className="text-sm text-[#A8A396] mt-1">
+                Gere um link pronto para abrir a chamada personalizada em outro celular ou guardar por
+                e-mail.
               </p>
-              <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                <input
-                  type="text"
-                  readOnly
-                  value={magicLink}
-                  aria-label="URL do link mágico"
-                  className="flex-1 min-h-[42px] px-3 rounded-lg bg-[#13151C] border border-white/10 text-xs text-[#E5E7EB] font-mono"
-                />
-                <button
-                  type="button"
-                  onClick={handleCopyLink}
-                  className="min-h-[42px] px-4 rounded-lg bg-[#D4AF37] text-[#0B0C10] text-xs font-semibold flex items-center justify-center gap-1.5 hover:bg-[#E5C454] cursor-pointer whitespace-nowrap"
-                >
-                  {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copied ? 'Copiado!' : 'Copiar Link'}</span>
-                </button>
-                {config.parentEmail && (
-                  <a
-                    href={`mailto:${encodeURIComponent(config.parentEmail)}?subject=${encodeURIComponent(
-                      `Chamada Mágica do Papai Noel para ${config.childName}`
-                    )}&body=${encodeURIComponent(
-                      `Abra este link mágico no celular para receber a ligação do Papai Noel para ${config.childName}:\n\n${magicLink}`
-                    )}`}
-                    className="min-h-[42px] px-4 rounded-lg border border-white/20 text-xs font-medium text-white flex items-center justify-center gap-1.5 hover:bg-white/10 whitespace-nowrap"
-                  >
-                    <Mail className="w-3.5 h-3.5" />
-                    <span>Abrir E-mail</span>
-                  </a>
-                )}
-              </div>
             </div>
-          )}
-        </section>
+
+            <div className="flex flex-col sm:flex-row gap-3">
+              <div className="relative flex-1">
+                <Mail
+                  className="w-4 h-4 text-[#9CA3AF] absolute left-4 top-1/2 -translate-y-1/2 pointer-events-none"
+                  aria-hidden="true"
+                />
+                <input
+                  type="email"
+                  value={config.parentEmail}
+                  onChange={(e) => updateField('parentEmail', e.target.value)}
+                  placeholder="seuemail@exemplo.com"
+                  className="w-full min-h-[48px] pl-11 pr-4 rounded-xl bg-[#0B0C10] border border-white/15 text-sm text-white placeholder:text-[#6B7280] focus:outline-none focus:border-[#D4AF37]"
+                />
+              </div>
+
+              <button
+                type="button"
+                onClick={handleGenerateMagicLink}
+                disabled={isSendingLink}
+                className="min-h-[48px] px-5 rounded-xl border border-[#D4AF37]/50 bg-[#1B1E28] text-sm font-semibold text-[#F5D97E] hover:bg-[#242836] transition-colors flex items-center justify-center gap-2 whitespace-nowrap cursor-pointer disabled:opacity-60"
+              >
+                <Send className="w-4 h-4" aria-hidden="true" />
+                <span>{isSendingLink ? 'Gerando...' : 'Gerar Link Mágico'}</span>
+              </button>
+            </div>
+
+            {linkError && <p className="text-xs text-red-400">{linkError}</p>}
+
+            {magicLink && (
+              <div className="rounded-xl bg-[#0B0C10] border border-[#D4AF37]/30 p-4 space-y-3">
+                <p className="text-xs text-[#D4AF37] font-medium">
+                  Link mágico criado com sucesso
+                  {config.parentEmail ? ` para ${config.parentEmail}` : ''}:
+                </p>
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                  <input
+                    type="text"
+                    readOnly
+                    value={magicLink}
+                    aria-label="URL do link mágico"
+                    className="flex-1 min-h-[42px] px-3 rounded-lg bg-[#13151C] border border-white/10 text-xs text-[#E5E7EB] font-mono"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleCopyLink}
+                    className="min-h-[42px] px-4 rounded-lg bg-[#D4AF37] text-[#0B0C10] text-xs font-semibold flex items-center justify-center gap-1.5 hover:bg-[#E5C454] cursor-pointer whitespace-nowrap"
+                  >
+                    {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copied ? 'Copiado!' : 'Copiar Link'}</span>
+                  </button>
+                  {config.parentEmail && (
+                    <a
+                      href={`mailto:${encodeURIComponent(config.parentEmail)}?subject=${encodeURIComponent(
+                        `Chamada Mágica do Papai Noel para ${config.childName}`
+                      )}&body=${encodeURIComponent(
+                        `Abra este link mágico no celular para receber a ligação do Papai Noel para ${config.childName}:\n\n${magicLink}`
+                      )}`}
+                      className="min-h-[42px] px-4 rounded-lg border border-white/20 text-xs font-medium text-white flex items-center justify-center gap-1.5 hover:bg-white/10 whitespace-nowrap"
+                    >
+                      <Mail className="w-3.5 h-3.5" />
+                      <span>Abrir E-mail</span>
+                    </a>
+                  )}
+                </div>
+              </div>
+            )}
+          </section>
+        )}
 
         {/* Sticky Bottom Action Bar */}
         <div className="fixed bottom-0 left-0 right-0 z-30 bg-gradient-to-t from-[#0B0C10] via-[#0B0C10]/95 to-transparent pt-6 pb-safe px-4 sm:px-8">
           <div className="max-w-5xl mx-auto flex flex-col sm:flex-row items-center justify-between gap-3 rounded-2xl border border-[#D4AF37]/30 bg-[#13151C] p-3 sm:p-4 shadow-2xl">
             <div className="hidden sm:block text-sm">
               <span className="text-[#F7F4EC] font-semibold">
-                {selectedPlan.title} ({selectedPlan.durationSeconds}s)
+                {selectedPlan.title} (
+                {isAudioPlan ? 'Só Áudio' : `${selectedPlan.durationSeconds}s`})
               </span>
               <span className="text-[#9CA3AF] mx-2">·</span>
               <span className="text-[#F5D97E] font-semibold tabular-nums">
                 {selectedPlan.priceLabel}
               </span>
             </div>
-            <button
-              type="submit"
-              disabled={ctaCountdown > 0}
-              className="w-full sm:w-auto min-h-[52px] px-7 rounded-xl bg-[#D4AF37] text-[#0B0C10] font-bold text-base flex items-center justify-center gap-2.5 shadow-lg hover:bg-[#E5C454] active:scale-[0.98] transition-all cursor-pointer disabled:opacity-55 disabled:cursor-not-allowed disabled:hover:bg-[#D4AF37] tabular-nums"
-            >
-              <PhoneCall className="w-5 h-5" aria-hidden="true" />
-              <span>
-                {ctaCountdown > 0
-                  ? `Iniciar Ligação em ${ctaCountdown}s`
-                  : 'Iniciar Ligação Agora'}
-              </span>
-            </button>
+            {isAudioPlan ? (
+              <button
+                type="submit"
+                disabled={isGeneratingAudio}
+                className="w-full sm:w-auto min-h-[52px] px-7 rounded-xl bg-emerald-500 text-[#0B0C10] font-bold text-base flex items-center justify-center gap-2.5 shadow-lg hover:bg-emerald-400 active:scale-[0.98] transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait"
+              >
+                {isGeneratingAudio ? (
+                  <>
+                    <Loader2 className="w-5 h-5 animate-spin" aria-hidden="true" />
+                    <span>Gerando Áudio Mágico...</span>
+                  </>
+                ) : (
+                  <>
+                    <Volume2 className="w-5 h-5" aria-hidden="true" />
+                    <span>Gerar Áudio Mágico</span>
+                  </>
+                )}
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={ctaCountdown > 0}
+                className="w-full sm:w-auto min-h-[52px] px-7 rounded-xl bg-[#D4AF37] text-[#0B0C10] font-bold text-base flex items-center justify-center gap-2.5 shadow-lg hover:bg-[#E5C454] active:scale-[0.98] transition-all cursor-pointer disabled:opacity-55 disabled:cursor-not-allowed disabled:hover:bg-[#D4AF37] tabular-nums"
+              >
+                <PhoneCall className="w-5 h-5" aria-hidden="true" />
+                <span>
+                  {ctaCountdown > 0
+                    ? `Iniciar Ligação em ${ctaCountdown}s`
+                    : 'Iniciar Ligação Agora'}
+                </span>
+              </button>
+            )}
           </div>
         </div>
       </form>

@@ -1,6 +1,14 @@
-export type PlanId = '15s' | '30s' | '60s' | 'familia';
+export type PlanId = '15s' | '30s' | '60s' | 'familia' | 'audio';
 export type FarewellType = 'mamae' | 'duendes' | 'renas' | 'carta';
-export type AppScreen = 'home' | 'parent' | 'debug-panel' | 'countdown' | 'incoming' | 'call' | 'ended';
+export type AppScreen =
+  | 'home'
+  | 'parent'
+  | 'debug-panel'
+  | 'countdown'
+  | 'incoming'
+  | 'call'
+  | 'ended'
+  | 'audio-magic';
 export type SantaVideoState = 'hello' | 'listening' | 'talking' | 'goodbye';
 
 export interface PlanOption {
@@ -52,6 +60,16 @@ export const PLANS: PlanOption[] = [
     highlightNote:
       'Por apenas R$ 10 a mais, faça chamadas ILIMITADAS para todos os filhos, primos e sobrinhos até o Natal e repita a ligação quantas vezes quiser!',
   },
+  {
+    id: 'audio',
+    title: 'Áudio Mágico',
+    durationSeconds: 0,
+    priceLabel: 'R$ 4,90',
+    summary: 'Mensagem de voz do Papai Noel por link, para guardar e ouvir quando quiser.',
+    interactive: false,
+    badge: 'ISCA',
+    topTag: 'SÓ ÁUDIO · SEM CHAMADA',
+  },
 ];
 
 export interface FarewellOption {
@@ -98,6 +116,17 @@ export interface PreparedCallMedia {
   greetingAudioBase64: string | null;
   greetingAudioMimeType: string | null;
   farewellText: string;
+  useBrowserFallback?: boolean;
+  voiceSource?: string;
+  ttsError?: string | null;
+}
+
+export interface PreparedAudioMagic {
+  audioText: string;
+  audioBase64: string | null;
+  audioMimeType: string | null;
+  mimeType?: string | null;
+  shareUrl: string;
   useBrowserFallback?: boolean;
   voiceSource?: string;
   ttsError?: string | null;

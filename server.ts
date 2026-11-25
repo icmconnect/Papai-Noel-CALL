@@ -27,7 +27,7 @@ function resolveSantaTtsModel(requestedModel?: string): string {
   return DEFAULT_GEMINI_TTS_MODEL;
 }
 
-type PlanId = '15s' | '30s' | '60s' | 'familia';
+type PlanId = '15s' | '30s' | '60s' | 'familia' | 'audio';
 type FarewellType = 'mamae' | 'duendes' | 'renas' | 'carta';
 
 interface CachedGreeting {
@@ -67,10 +67,18 @@ interface CachedFarewell {
   ttsError: string | null;
 }
 
+interface CachedAudioMagic {
+  audioText: string;
+  audioBase64: string;
+  audioMimeType: string;
+  voiceSource: string;
+}
+
 const MAX_CACHE_ENTRIES = 100;
 const greetingCache = new Map<string, CachedGreeting>();
 const bridgeCache = new Map<string, CachedBridge>();
 const farewellCache = new Map<string, CachedFarewell>();
+const audioMagicCache = new Map<string, CachedAudioMagic>();
 const audioBank = new Map<string, {audioBase64: string; audioMimeType: string; text: string}>();
 
 let roundRobinKeyIndex = 0;
@@ -947,6 +955,26 @@ function buildFallbackBridge(childName: string, advice: string): string {
   );
 }
 
+function buildFallbackAudioMagicText(
+  childName: string,
+  praise: string,
+  advice: string
+): string {
+  const safeName = childName.trim() || 'meu bem';
+  const cleanPraise = prepareSantaSpeechScript(praise, 44).replace(/[.!?…]+$/g, '');
+  const cleanAdvice = prepareSantaSpeechScript(advice, 44).replace(/[.!?…]+$/g, '');
+  const praisePart = cleanPraise ? ` Que orgulho por ${cleanPraise}!` : '';
+  const advicePart = cleanAdvice ? ` Lembre-se de ${cleanAdvice}.` : '';
+  const raw = `Olá, ${safeName}!${praisePart}${advicePart} Feliz Natal!`;
+  const script = prepareSantaSpeechScript(raw, 180);
+  if (/feliz natal/i.test(script)) {
+    return script;
+  }
+  const suffix = ' Feliz Natal!';
+  const head = prepareSantaSpeechScript(raw, 180 - suffix.length).replace(/[.!?…]+$/g, '');
+  return `${head}.${suffix}`;
+}
+
 function normalizeCompareText(value: string): string {
   return value
     .normalize('NFD')
@@ -1165,47 +1193,63 @@ function validateParentFields(
 const REPLY_RATE_LIMIT_WINDOW_MS = 60_000;
 const REPLY_RATE_LIMIT_MAX = 6;
 const replyIpHits = new Map<string, number[]>();
+const audioIpHits = new Map<string, number[]>();
 
-function checkReplyRateLimit(req: Request, res: Response, next: () => void): void {
-  const ip = (req.ip || req.socket.remoteAddress || 'unknown').trim();
-  const now = Date.now();
-  const cutoff = now - REPLY_RATE_LIMIT_WINDOW_MS;
+function createIpRateLimiter(hitsMap: Map<string, number[]>, maxPerMinute: number, errorMessage: string) {
+  return (req: Request, res: Response, next: () => void): void => {
+    const ip = (req.ip || req.socket.remoteAddress || 'unknown').trim();
+    const now = Date.now();
+    const cutoff = now - REPLY_RATE_LIMIT_WINDOW_MS;
 
-  if (replyIpHits.size > 500) {
-    for (const [key, timestamps] of replyIpHits.entries()) {
-      const fresh = timestamps.filter((t) => t > cutoff);
-      if (fresh.length === 0) {
-        replyIpHits.delete(key);
-      } else {
-        replyIpHits.set(key, fresh);
+    if (hitsMap.size > 500) {
+      for (const [key, timestamps] of hitsMap.entries()) {
+        const fresh = timestamps.filter((t) => t > cutoff);
+        if (fresh.length === 0) {
+          hitsMap.delete(key);
+        } else {
+          hitsMap.set(key, fresh);
+        }
       }
     }
-  }
 
-  const recent = (replyIpHits.get(ip) || []).filter((t) => t > cutoff);
-  if (recent.length >= REPLY_RATE_LIMIT_MAX) {
-    const oldest = recent[0];
-    const retryAfterSec = Math.max(1, Math.ceil((oldest + REPLY_RATE_LIMIT_WINDOW_MS - now) / 1000));
-    res.setHeader('Retry-After', String(retryAfterSec));
-    res.status(429).json({
-      error: 'Muitas mensagens seguidas. Aguarde alguns segundos antes de falar novamente.',
-    });
-    return;
-  }
+    const recent = (hitsMap.get(ip) || []).filter((t) => t > cutoff);
+    if (recent.length >= maxPerMinute) {
+      const oldest = recent[0];
+      const retryAfterSec = Math.max(1, Math.ceil((oldest + REPLY_RATE_LIMIT_WINDOW_MS - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfterSec));
+      res.status(429).json({
+        error: errorMessage,
+      });
+      return;
+    }
 
-  recent.push(now);
-  replyIpHits.set(ip, recent);
-  next();
+    recent.push(now);
+    hitsMap.set(ip, recent);
+    next();
+  };
 }
+
+const checkReplyRateLimit = createIpRateLimiter(
+  replyIpHits,
+  REPLY_RATE_LIMIT_MAX,
+  'Muitas mensagens seguidas. Aguarde alguns segundos antes de falar novamente.'
+);
+
+const checkAudioRateLimit = createIpRateLimiter(
+  audioIpHits,
+  REPLY_RATE_LIMIT_MAX,
+  'Muitas solicitações de áudio em seguida. Aguarde alguns segundos e tente novamente.'
+);
 
 async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
 
-  // Limite estrito de 2MB em /api/santa/reply; demais rotas mantêm parsing JSON padrão
+  // Limite estrito de 2MB em /api/santa/reply e /api/santa/audio; demais rotas mantêm parsing JSON padrão
   app.use('/api/santa/reply', express.json({limit: '2mb'}));
+  app.use('/api/santa/audio', express.json({limit: '2mb'}));
   app.use((req: Request, res: Response, next) => {
-    if (req.path === '/api/santa/reply') {
+    if (req.path === '/api/santa/reply' || req.path === '/api/santa/audio') {
       next();
       return;
     }
@@ -2017,6 +2061,167 @@ REGRAS OBRIGATÓRIAS:
       if (!res.writableEnded) res.end();
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
+      cleanupDisconnectListeners();
+    }
+  });
+
+  app.post('/api/santa/audio', checkAudioRateLimit, async (req: Request, res: Response) => {
+    const {controller: routeAbortController, cleanup: cleanupDisconnectListeners} =
+      createRequestAbortController(req, res);
+
+    try {
+      const body = (req.body || {}) as {
+        childName?: string;
+        childAge?: string;
+        praise?: string;
+        advice?: string;
+        audioText?: string;
+      };
+
+      const validation = validateParentFields(
+        {
+          childName: body.childName,
+          praise: body.praise,
+          advice: body.advice,
+        },
+        {requireChildName: true}
+      );
+      if (!validation.ok) {
+        res.status(400).json({error: validation.error});
+        return;
+      }
+
+      const presetTextRes = validateParentField(body.audioText, 'Texto do áudio', 200, false);
+      if (!presetTextRes.ok) {
+        res.status(400).json({error: presetTextRes.error});
+        return;
+      }
+
+      const childName = validation.childName;
+      const childAge = typeof body.childAge === 'string' ? body.childAge.trim().slice(0, 12) : '';
+      const praise = validation.praise;
+      const advice = validation.advice;
+      const presetScript = presetTextRes.value
+        ? prepareSantaSpeechScript(presetTextRes.value, 180)
+        : '';
+
+      const cacheKey = `${childName.toLowerCase()}|${childAge}|${praise}|${advice}|${presetScript}`;
+      const baseUrl = resolvePublicBaseUrl(req);
+      const buildShareUrl = (finalText: string) => {
+        const sharePayload = Buffer.from(
+          JSON.stringify({
+            planId: 'audio' as const,
+            childName,
+            childAge,
+            praise,
+            advice,
+            audioText: finalText,
+          }),
+          'utf8'
+        ).toString('base64url');
+        return `${baseUrl}/?audio=${sharePayload}`;
+      };
+
+      const cached = audioMagicCache.get(cacheKey);
+      if (cached && cached.audioBase64) {
+        res.json({
+          audioBase64: cached.audioBase64,
+          audioMimeType: cached.audioMimeType,
+          mimeType: cached.audioMimeType,
+          audioText: cached.audioText,
+          shareUrl: buildShareUrl(cached.audioText),
+          useBrowserFallback: false,
+          voiceSource: cached.voiceSource,
+        });
+        return;
+      }
+
+      let audioText = presetScript || buildFallbackAudioMagicText(childName, praise, advice);
+      if (!presetScript && getConfiguredApiKeys().length > 0 && !routeAbortController.signal.aborted) {
+        try {
+          const prompt = `Você é o verdadeiro Papai Noel brasileiro gravando uma mensagem de voz carinhosa e mágica.
+Dados da criança (NUNCA repita rótulos como "Nome:" ou "Elogio:", integre naturalmente):
+- Nome: ${childName}
+${childAge ? `- Idade: ${childAge} anos` : ''}
+${praise ? `- Elogio: ${praise}` : ''}
+${advice ? `- Conselho: ${advice}` : ''}
+
+REGRAS OBRIGATÓRIAS:
+- Gere UM único recado completo em português do Brasil (NO MÁXIMO 165 caracteres), acolhedor e alegre.
+- Cite o nome ${childName}, integre o elogio e o conselho (quando informados) e termine obrigatoriamente com "Feliz Natal!".
+- NUNCA escreva "Ho ho ho", colchetes, parênteses, aspas, asteriscos ou instruções.
+- Retorne APENAS a fala direta para a criança ouvir.`;
+
+          const textResult = await generateSantaText({
+            contents: prompt,
+            maxAttempts: 2,
+            externalSignal: routeAbortController.signal,
+          });
+          if (textResult?.text?.trim()) {
+            const candidate = prepareSantaSpeechScript(textResult.text, 180);
+            if (candidate) {
+              if (/feliz natal/i.test(candidate)) {
+                audioText = candidate;
+              } else {
+                const suffix = ' Feliz Natal!';
+                const head = prepareSantaSpeechScript(candidate, 180 - suffix.length).replace(
+                  /[.!?…]+$/g,
+                  ''
+                );
+                audioText = `${head}.${suffix}`;
+              }
+            }
+          }
+        } catch (err) {
+          if (routeAbortController.signal.aborted || isAbortError(err)) {
+            return;
+          }
+          console.warn('Audio Magic text fallback used:', extractReadableError(err));
+        }
+      }
+
+      if (routeAbortController.signal.aborted || res.writableEnded) {
+        return;
+      }
+
+      const synth = await synthesizeSantaVoice(
+        audioText,
+        undefined,
+        DEFAULT_GEMINI_TTS_MODEL,
+        routeAbortController.signal
+      );
+
+      if (routeAbortController.signal.aborted || res.writableEnded) {
+        return;
+      }
+
+      if (synth.audioBase64 && synth.audioMimeType) {
+        setLimitedCache(audioMagicCache, cacheKey, {
+          audioText,
+          audioBase64: synth.audioBase64,
+          audioMimeType: synth.audioMimeType,
+          voiceSource: synth.voiceSource,
+        });
+      }
+
+      res.json({
+        audioBase64: synth.audioBase64,
+        audioMimeType: synth.audioMimeType,
+        mimeType: synth.audioMimeType,
+        audioText,
+        shareUrl: buildShareUrl(audioText),
+        useBrowserFallback: false,
+        voiceSource: synth.audioBase64 ? synth.voiceSource : 'none',
+        ...(synth.ttsError ? {ttsError: synth.ttsError} : {}),
+      });
+    } catch (error) {
+      if (routeAbortController.signal.aborted || isAbortError(error) || res.writableEnded) {
+        return;
+      }
+      const message = extractReadableError(error);
+      console.error('/api/santa/audio error:', message);
+      res.status(500).json({error: message});
+    } finally {
       cleanupDisconnectListeners();
     }
   });

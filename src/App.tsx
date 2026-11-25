@@ -1,5 +1,6 @@
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {CheckCircle2, Crown, Home, RotateCcw, Share2} from 'lucide-react';
+import {CheckCircle2, ChevronDown, Crown, Home, RotateCcw, Share2} from 'lucide-react';
+import {AudioMagicScreen} from './components/AudioMagicScreen';
 import {DebugPanel} from './components/DebugPanel';
 import {HomeScreen} from './components/HomeScreen';
 import {IncomingCallScreen} from './components/IncomingCallScreen';
@@ -7,7 +8,14 @@ import {OfflineIndicator} from './components/OfflineIndicator';
 import {ParentPanel} from './components/ParentPanel';
 import {SnowfallBackground} from './components/SnowfallBackground';
 import {VideoCallScreen} from './components/VideoCallScreen';
-import {AppScreen, CallConfig, FarewellType, PlanId, PreparedCallMedia} from './types';
+import {
+  AppScreen,
+  CallConfig,
+  FarewellType,
+  PlanId,
+  PreparedAudioMagic,
+  PreparedCallMedia,
+} from './types';
 import {playSantaAudio, stopCurrentSantaVoice, unlockAudioContext} from './utils/audioEngine';
 
 const DEFAULT_CONFIG: CallConfig = {
@@ -20,30 +28,83 @@ const DEFAULT_CONFIG: CallConfig = {
   parentEmail: '',
 };
 
+function decodeBase64UrlJson<T>(raw: string): T | null {
+  try {
+    const base64 = raw.replace(/-/g, '+').replace(/_/g, '/');
+    const pad = base64.length % 4 ? '='.repeat(4 - (base64.length % 4)) : '';
+    const json = decodeURIComponent(
+      Array.prototype.map
+        .call(
+          window.atob(base64 + pad),
+          (c: string) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)
+        )
+        .join('')
+    );
+    return JSON.parse(json) as T;
+  } catch {
+    return null;
+  }
+}
+
 function decodeMagicConfigFromUrl(): CallConfig | null {
   if (typeof window === 'undefined') return null;
   const params = new URLSearchParams(window.location.search);
   const raw = params.get('chamada');
   if (!raw) return null;
 
-  try {
-    const base64 = raw.replace(/-/g, '+').replace(/_/g, '/');
-    const pad = base64.length % 4 ? '='.repeat(4 - (base64.length % 4)) : '';
-    const json = decodeURIComponent(
-      Array.prototype.map
-        .call(window.atob(base64 + pad), (c: string) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
-        .join('')
-    );
-    const parsed = JSON.parse(json) as Partial<CallConfig>;
-    if (!parsed.childName) return null;
-    return {
+  const parsed = decodeBase64UrlJson<Partial<CallConfig>>(raw);
+  if (!parsed?.childName) return null;
+  return {
+    ...DEFAULT_CONFIG,
+    ...parsed,
+  };
+}
+
+function decodeAudioMagicFromUrl(): {config: CallConfig; audioText?: string} | null {
+  if (typeof window === 'undefined') return null;
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get('audio');
+  if (!raw) return null;
+
+  const parsed = decodeBase64UrlJson<Partial<CallConfig> & {audioText?: string}>(raw);
+  if (!parsed?.childName) return null;
+  return {
+    config: {
       ...DEFAULT_CONFIG,
       ...parsed,
-    };
-  } catch {
-    return null;
-  }
+      planId: 'audio',
+    },
+    audioText: typeof parsed.audioText === 'string' ? parsed.audioText : undefined,
+  };
 }
+
+const HOME_FAQ_ITEMS: Array<{question: string; answer: string}> = [
+  {
+    question: 'Como funciona a ligação de vídeo do Papai Noel personalizada?',
+    answer:
+      'Os pais entram na Área dos Pais protegida por uma conta matemática simples, escolhem o plano e informam o nome da criança, idade, elogios da semana e um conselho carinhoso. Em poucos segundos o celular toca como uma videochamada real e o Papai Noel conversa chamando a criança pelo nome.',
+  },
+  {
+    question: 'O que é o plano Áudio Mágico de R$ 4,90 e qual a diferença para a chamada de vídeo?',
+    answer:
+      'O Áudio Mágico (R$ 4,90) gera apenas uma mensagem de voz personalizada do Papai Noel com o nome, elogio e conselho da criança, entregue por link para ouvir quando quiser, baixar e enviar no WhatsApp, sem chamada de vídeo. Já os planos a partir de R$ 9,90 fazem a ligação de vídeo completa na tela.',
+  },
+  {
+    question: 'Funciona no iPhone (Safari) e no Android (Chrome) sem baixar aplicativo?',
+    answer:
+      'Sim. Tudo funciona direto no navegador (Safari no iPhone e Chrome no Android) sem precisar instalar aplicativo pela App Store ou Google Play, com desbloqueio de áudio ao atender e botão Segurar para Falar compatível com iOS.',
+  },
+  {
+    question: 'Quais são todos os planos disponíveis?',
+    answer:
+      'Você pode escolher entre o Áudio Mágico (R$ 4,90, só voz por link), Chamada Rápida de 15s (R$ 9,90), Chamada Especial de 30s (R$ 19,90), Conversa Mágica interativa de 60s (R$ 29,90) e o Passe Família Ilimitado (R$ 39,90) para ligar para filhos, primos e sobrinhos até o Natal.',
+  },
+  {
+    question: 'Posso compartilhar o áudio ou a chamada para abrir em outro celular?',
+    answer:
+      'Sim. No Áudio Mágico você recebe um link pronto para compartilhar no WhatsApp ou baixar o arquivo. Nos planos de vídeo, o Painel dos Pais gera um Link Mágico para abrir a chamada personalizada em qualquer outro aparelho.',
+  },
+];
 
 function getFarewellSummaryText(farewellType: FarewellType): string {
   switch (farewellType) {
@@ -150,22 +211,50 @@ export default function App() {
           planId: 'familia' as PlanId,
         },
         hasCustom: true,
+        isAudioLink: false,
+        initialAudioText: undefined as string | undefined,
+      };
+    }
+    const audioFromUrl = decodeAudioMagicFromUrl();
+    if (audioFromUrl) {
+      return {
+        config: audioFromUrl.config,
+        hasCustom: true,
+        isAudioLink: true,
+        initialAudioText: audioFromUrl.audioText,
       };
     }
     const fromUrl = decodeMagicConfigFromUrl();
     if (fromUrl) {
-      return {config: fromUrl, hasCustom: true};
+      return {
+        config: fromUrl,
+        hasCustom: true,
+        isAudioLink: false,
+        initialAudioText: undefined as string | undefined,
+      };
     }
-    return {config: DEFAULT_CONFIG, hasCustom: false};
+    return {
+      config: DEFAULT_CONFIG,
+      hasCustom: false,
+      isAudioLink: false,
+      initialAudioText: undefined as string | undefined,
+    };
   });
 
   const [config, setConfig] = useState<CallConfig>(initialState.config);
   const [hasCustomConfig, setHasCustomConfig] = useState<boolean>(initialState.hasCustom);
-  const [screen, setScreen] = useState<AppScreen>(isDebugRoute ? 'call' : 'home');
+  const [screen, setScreen] = useState<AppScreen>(
+    isDebugRoute ? 'call' : initialState.isAudioLink ? 'audio-magic' : 'home'
+  );
   const [countdownSeconds, setCountdownSeconds] = useState<number>(10);
   const [preparedMedia, setPreparedMedia] = useState<PreparedCallMedia | null>(null);
   const [isPreparingCall, setIsPreparingCall] = useState<boolean>(false);
   const [prepareError, setPrepareError] = useState<string | null>(null);
+  const [audioMagicMedia, setAudioMagicMedia] = useState<PreparedAudioMagic | null>(null);
+  const [isGeneratingAudioMagic, setIsGeneratingAudioMagic] = useState<boolean>(
+    initialState.isAudioLink
+  );
+  const [audioMagicError, setAudioMagicError] = useState<string | null>(null);
   const [frontCameraStream, setFrontCameraStream] = useState<MediaStream | null>(null);
 
   const helloVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -175,6 +264,8 @@ export default function App() {
   const countdownTimerRef = useRef<number | null>(null);
   const screenRef = useRef<AppScreen>(screen);
   const prepareRequestIdRef = useRef<number>(0);
+  const audioRequestIdRef = useRef<number>(0);
+  const audioMagicPresetTextRef = useRef<string | undefined>(initialState.initialAudioText);
 
   useEffect(() => {
     screenRef.current = screen;
@@ -259,23 +350,92 @@ export default function App() {
     }
   }, []);
 
-  // Auto-prepare greeting on debug route mount
+  const generateAudioMagicFromServer = useCallback(
+    async (targetConfig: CallConfig, presetAudioText?: string) => {
+      const requestId = ++audioRequestIdRef.current;
+      setIsGeneratingAudioMagic(true);
+      setAudioMagicError(null);
+      setAudioMagicMedia(null);
+
+      try {
+        const res = await fetch('/api/santa/audio', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            childName: targetConfig.childName,
+            childAge: targetConfig.childAge,
+            praise: targetConfig.praise,
+            advice: targetConfig.advice,
+            ...(presetAudioText ? {audioText: presetAudioText} : {}),
+          }),
+        });
+        const data = (await res.json()) as PreparedAudioMagic & {error?: string};
+        if (!res.ok) {
+          throw new Error(data.error || 'Erro ao gerar o Áudio Mágico do Papai Noel.');
+        }
+        if (requestId !== audioRequestIdRef.current) {
+          return null;
+        }
+        setAudioMagicMedia(data);
+        return data;
+      } catch (err) {
+        if (requestId !== audioRequestIdRef.current) {
+          return null;
+        }
+        const msg =
+          err instanceof Error ? err.message : 'Não foi possível gerar o Áudio Mágico agora.';
+        setAudioMagicError(msg);
+        return null;
+      } finally {
+        if (requestId === audioRequestIdRef.current) {
+          setIsGeneratingAudioMagic(false);
+        }
+      }
+    },
+    []
+  );
+
+  // Auto-prepare greeting on debug route mount or hydrate /?audio= link on cold cache
   useEffect(() => {
     if (isDebugRoute) {
       void prepareGreetingFromServer(config);
+      return;
     }
-  }, [config, isDebugRoute, prepareGreetingFromServer]);
+    if (initialState.isAudioLink) {
+      void generateAudioMagicFromServer(initialState.config, initialState.initialAudioText);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleGenerateAudioMagicFromParent = () => {
+    setHasCustomConfig(true);
+    setPrepareError(null);
+    audioMagicPresetTextRef.current = undefined;
+    screenRef.current = 'audio-magic';
+    setScreen('audio-magic');
+    void generateAudioMagicFromServer(config);
+  };
 
   const handleStartDirectFromHome = () => {
+    if (config.planId === 'audio') {
+      handleGenerateAudioMagicFromParent();
+      return;
+    }
     void prepareGreetingFromServer(config);
+    screenRef.current = 'incoming';
     setScreen('incoming');
   };
 
   const handleStartCountdownFromParent = () => {
+    if (config.planId === 'audio') {
+      handleGenerateAudioMagicFromParent();
+      return;
+    }
     setHasCustomConfig(true);
     setPrepareError(null);
     setPreparedMedia(null);
     setCountdownSeconds(10);
+    screenRef.current = 'countdown';
     setScreen('countdown');
 
     void prepareGreetingFromServer(config);
@@ -295,6 +455,7 @@ export default function App() {
           window.clearInterval(countdownTimerRef.current);
           countdownTimerRef.current = null;
         }
+        screenRef.current = 'incoming';
         setScreen('incoming');
       }
     }, 100);
@@ -359,7 +520,8 @@ export default function App() {
     };
   }, [stopCameraStream]);
 
-  const isCallStageMounted = screen === 'incoming' || screen === 'call';
+  const isCallStageMounted =
+    config.planId !== 'audio' && (screen === 'incoming' || screen === 'call');
   const shareUrl = typeof window !== 'undefined' ? window.location.origin : '';
   const whatsappMessage = encodeURIComponent(
     `Olha que emocionante! Acabamos de fazer uma chamada de vídeo ao vivo com o Papai Noel falando o nome da nossa criança! Vale muito a pena testar com os pequenos: ${shareUrl}`
@@ -371,7 +533,7 @@ export default function App() {
       <SnowfallBackground />
       <OfflineIndicator />
 
-      {!isCallStageMounted && (
+      {!isCallStageMounted && config.planId !== 'audio' && (
         <div
           aria-hidden="true"
           className="fixed w-px h-px opacity-0 pointer-events-none overflow-hidden -z-10"
@@ -384,21 +546,61 @@ export default function App() {
       )}
 
       {screen === 'home' && (
-        <HomeScreen
-          config={config}
-          hasCustomConfig={hasCustomConfig}
-          onUnlockParent={() => {
-            setPrepareError(null);
-            setScreen('parent');
-          }}
-          onOpenDebugPanel={() => {
-            setPrepareError(null);
-            setScreen('debug-panel');
-          }}
-          onStartPreparedCall={handleStartDirectFromHome}
-          isPreparingCall={isPreparingCall}
-          prepareError={prepareError}
-        />
+        <>
+          <HomeScreen
+            config={config}
+            hasCustomConfig={hasCustomConfig}
+            onUnlockParent={() => {
+              setPrepareError(null);
+              setScreen('parent');
+            }}
+            onOpenDebugPanel={() => {
+              setPrepareError(null);
+              setScreen('debug-panel');
+            }}
+            onStartPreparedCall={handleStartDirectFromHome}
+            isPreparingCall={isPreparingCall}
+            prepareError={prepareError}
+          />
+
+          <section
+            aria-labelledby="faq-home-heading"
+            className="relative z-10 w-full max-w-6xl mx-auto px-4 sm:px-8 pt-6 pb-14"
+          >
+            <div className="rounded-3xl border border-white/10 bg-[#13151C]/90 backdrop-blur-md p-6 sm:p-8 space-y-5 shadow-2xl">
+              <div className="space-y-1">
+                <h2
+                  id="faq-home-heading"
+                  className="text-xl sm:text-2xl font-semibold text-[#F7F4EC]"
+                  style={{fontFamily: 'var(--font-display)'}}
+                >
+                  Perguntas Frequentes
+                </h2>
+                <p className="text-xs sm:text-sm text-[#A8A396]">
+                  Tire suas dúvidas sobre a ligação de vídeo do Papai Noel personalizada e o Áudio
+                  Mágico.
+                </p>
+              </div>
+
+              <div className="divide-y divide-white/10">
+                {HOME_FAQ_ITEMS.map((item) => (
+                  <details key={item.question} className="group py-3.5">
+                    <summary className="list-none flex items-center justify-between gap-4 cursor-pointer text-sm sm:text-base font-semibold text-[#F7F4EC] hover:text-[#F5D97E] transition-colors">
+                      <span>{item.question}</span>
+                      <ChevronDown
+                        className="w-4 h-4 text-[#D4AF37] shrink-0 transition-transform duration-200 group-open:rotate-180"
+                        aria-hidden="true"
+                      />
+                    </summary>
+                    <p className="mt-2.5 text-xs sm:text-sm text-[#C7C2B6] leading-relaxed pr-6">
+                      {item.answer}
+                    </p>
+                  </details>
+                ))}
+              </div>
+            </div>
+          </section>
+        </>
       )}
 
       {screen === 'debug-panel' && (
@@ -416,7 +618,31 @@ export default function App() {
           onChange={handleConfigChange}
           onBack={() => setScreen('home')}
           onStartCountdown={handleStartCountdownFromParent}
+          onGenerateAudioMagic={handleGenerateAudioMagicFromParent}
+          isGeneratingAudio={isGeneratingAudioMagic}
           error={prepareError}
+        />
+      )}
+
+      {screen === 'audio-magic' && (
+        <AudioMagicScreen
+          config={config}
+          audioMedia={audioMagicMedia}
+          isLoading={isGeneratingAudioMagic}
+          error={audioMagicError}
+          onRetry={() => {
+            void generateAudioMagicFromServer(config, audioMagicPresetTextRef.current);
+          }}
+          onUpgradeToVideoCall={() => {
+            setConfig((prev) => ({...prev, planId: '15s'}));
+            setPrepareError(null);
+            screenRef.current = 'parent';
+            setScreen('parent');
+          }}
+          onBackHome={() => {
+            screenRef.current = 'home';
+            setScreen('home');
+          }}
         />
       )}
 

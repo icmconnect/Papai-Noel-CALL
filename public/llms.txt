@@ -1,27 +1,37 @@
 # Chamada Mágica do Papai Noel (Portal Mágico do Polo Norte)
 
-> Aplicativo Web PWA brasileiro para realizar chamadas de vídeo realistas e personalizadas ao vivo com o Papai Noel pelo nome da criança, diretamente no navegador do iPhone (Safari) e Android (Chrome), sem precisar baixar aplicativo nas lojas.
+> Serviço web brasileiro para criar uma **ligação de vídeo do Papai Noel personalizada** pelo nome da criança ou gerar um **Áudio Mágico** exclusivo por link, diretamente no navegador do iPhone (Safari) e Android (Chrome), sem baixar aplicativo.
 
-## Sobre o Serviço
-O **Chamada Mágica do Papai Noel** resolve a limitação dos vídeos natalinos genéricos pré-gravados ao oferecer uma ligação simulada com aparência nativa de videochamada móvel, na qual o Papai Noel chama a criança pelo nome, menciona sua idade, elogia conquistas da semana, dá um conselho carinhoso definido pelos pais, conversa ao vivo em português brasileiro (`pt-BR`) e encerra com uma desculpa mágica personalizada nos 6 segundos finais.
+## O Que é o Serviço
+O **Chamada Mágica do Papai Noel** oferece experiências natalinas sob medida em português do Brasil (`pt-BR`), substituindo vídeos genéricos pré-gravados por falas personalizadas criadas na hora com os dados informados pelos pais: nome da criança, idade, elogios da semana, conselho carinhoso e motivo da despedida.
 
-## Planos e Preços (R$)
-- **Chamada Rápida (15s) — R$ 9,90**: Saudação personalizada com o nome da criança e despedida mágica.
-- **Chamada Especial (30s) — R$ 19,90**: Saudação pelo nome + elogio personalizado da semana + conselho carinhoso + despedida.
-- **Conversa Mágica (60s) — R$ 29,90**: Ligação completa com diálogo interativo ao vivo com o Papai Noel via microfone.
-- **Passe Família Ilimitado (60s por chamada) — R$ 39,90**: Melhor escolha para famílias, permitindo chamadas ilimitadas até o Natal para filhos, primos e sobrinhos.
+## Planos e Preços (BRL)
+- **Áudio Mágico (só áudio, sem chamada) — R$ 4,90**: Mensagem de voz do Papai Noel personalizada por link (`/?audio=...`), para ouvir na hora, baixar em arquivo de áudio e guardar ou compartilhar no WhatsApp.
+- **Chamada Rápida (15s) — R$ 9,90**: Ligação de vídeo personalizada com o nome da criança e despedida mágica nos 3 segundos finais.
+- **Chamada Especial (30s) — R$ 19,90**: Ligação de vídeo com saudação pelo nome, elogio personalizado da semana, conselho carinhoso e despedida nos 6 segundos finais.
+- **Conversa Mágica (60s) — R$ 29,90**: Ligação de vídeo completa com diálogo interativo ao vivo com o Papai Noel usando o microfone do celular.
+- **Passe Família Ilimitado (60s por chamada) — R$ 39,90**: Melhor escolha para famílias com mais de uma criança, liberando chamadas ilimitadas até o Natal para filhos, primos e sobrinhos.
 
-## Diferenciais Principais
-- **Chamada realista pelo nome em tempo real**: Áudio em português do Brasil com voz grave e acolhedora e resposta conversacional rápida.
-- **Compatibilidade total com iPhone Safari e Android Chrome**: Arquitetura PWA sem necessidade de instalar aplicativo pela App Store ou Play Store, com desbloqueio síncrono de áudio/vídeo no clique de "Atender" e botão "Segurar para Falar" otimizado para iOS.
-- **Experiência imersiva 9:16**: Crossfade suave entre vídeos do Papai Noel (saudação inicial, ouvindo, falando e despedida), câmera frontal da criança em Picture-in-Picture (PiP) com moldura dourada natalina e som de sinos na Lista dos Bonzinhos.
-- **Privacidade e Controle dos Pais**: Acesso às configurações protegido por desafio matemático simples, cronômetro regressivo de 10 segundos para entregar o celular à criança e gerador de **Link Mágico** para abrir em outro aparelho ou enviar por e-mail.
-- **4 Motivos Criativos de Despedida**: Mamãe Noel chamando, duendes fazendo bagunça na fábrica, renas prontas no trenó e cartas urgentes no Polo Norte.
+## Como Comprar e Personalizar
+1. Na página inicial, clique em **Personalizar Ligação Mágica (Pais)** ou **Área dos Pais** no rodapé.
+2. Resolva a conta matemática simples de verificação para adultos.
+3. Escolha um dos 5 planos disponíveis (incluindo o **Áudio Mágico por R$ 4,90** ou os planos de **chamada de vídeo**).
+4. Preencha o nome da criança, idade (opcional), elogio da semana e conselho carinhoso.
+5. Para **Áudio Mágico**, clique em **Gerar Áudio Mágico** para ouvir, baixar ou compartilhar o link no WhatsApp. Para **Chamada de Vídeo**, selecione o motivo da despedida e clique para iniciar a contagem de 10 segundos antes de entregar o celular à criança (ou gere um Link Mágico `/?chamada=...`).
 
-## Público-Alvo
-- Pais, mães, avós, tios e responsáveis no Brasil buscando a melhor experiência online para o Papai Noel ligar por vídeo para seus filhos e crianças de 2 a 12 anos.
+## Aparelhos e Navegadores Suportados
+- **iPhone / iPad**: Safari no iOS com desbloqueio de áudio/vídeo no clique, microfone otimizado ("Segurar para Falar") e suporte a PWA.
+- **Android**: Google Chrome com suporte completo a videochamada simulada, câmera frontal em Picture-in-Picture (PiP), download de áudio e instalação como PWA.
+- **Computadores (Windows/Mac/Linux)**: Navegadores modernos (Chrome, Edge, Safari, Firefox).
+- **Sem instalação obrigatória**: Tudo roda direto no navegador.
 
-## Recursos para Indexação
-- Aplicação Web Principal: /
+## Privacidade e Segurança Infantil
+- Área dos Pais protegida por verificação matemática.
+- Validação automática e bloqueio de termos inadequados nos campos preenchidos.
+- Links mágicos (`/?chamada=...` e `/?audio=...`) codificam os dados da sessão diretamente na URL sem exigir cadastro complexo.
+
+## Contato e Recursos para Indexação
+- Site Principal: /
 - Sitemap XML: /sitemap.xml
 - Regras de Rastreamento: /robots.txt
+- Contato / Suporte aos Pais: via painel "Área dos Pais" (e-mail informado no envio do Link Mágico) em /
