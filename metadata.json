@@ -1,0 +1,6 @@
+{
+  "name": "Chamada Mágica do Papai Noel",
+  "description": "Videochamada mágica e interativa em tempo real com o Papai Noel, personalizada pelos pais para encantar as crianças no Natal.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

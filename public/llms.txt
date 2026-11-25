@@ -1,0 +1,27 @@
+# Chamada Mágica do Papai Noel (Portal Mágico do Polo Norte)
+
+> Aplicativo Web PWA brasileiro para realizar chamadas de vídeo realistas e personalizadas ao vivo com o Papai Noel pelo nome da criança, diretamente no navegador do iPhone (Safari) e Android (Chrome), sem precisar baixar aplicativo nas lojas.
+
+## Sobre o Serviço
+O **Chamada Mágica do Papai Noel** resolve a limitação dos vídeos natalinos genéricos pré-gravados ao oferecer uma ligação simulada com aparência nativa de videochamada móvel, na qual o Papai Noel chama a criança pelo nome, menciona sua idade, elogia conquistas da semana, dá um conselho carinhoso definido pelos pais, conversa ao vivo em português brasileiro (`pt-BR`) e encerra com uma desculpa mágica personalizada nos 6 segundos finais.
+
+## Planos e Preços (R$)
+- **Chamada Rápida (15s) — R$ 9,90**: Saudação personalizada com o nome da criança e despedida mágica.
+- **Chamada Especial (30s) — R$ 19,90**: Saudação pelo nome + elogio personalizado da semana + conselho carinhoso + despedida.
+- **Conversa Mágica (60s) — R$ 29,90**: Ligação completa com diálogo interativo ao vivo com o Papai Noel via microfone.
+- **Passe Família Ilimitado (60s por chamada) — R$ 39,90**: Melhor escolha para famílias, permitindo chamadas ilimitadas até o Natal para filhos, primos e sobrinhos.
+
+## Diferenciais Principais
+- **Chamada realista pelo nome em tempo real**: Áudio em português do Brasil com voz grave e acolhedora e resposta conversacional rápida.
+- **Compatibilidade total com iPhone Safari e Android Chrome**: Arquitetura PWA sem necessidade de instalar aplicativo pela App Store ou Play Store, com desbloqueio síncrono de áudio/vídeo no clique de "Atender" e botão "Segurar para Falar" otimizado para iOS.
+- **Experiência imersiva 9:16**: Crossfade suave entre vídeos do Papai Noel (saudação inicial, ouvindo, falando e despedida), câmera frontal da criança em Picture-in-Picture (PiP) com moldura dourada natalina e som de sinos na Lista dos Bonzinhos.
+- **Privacidade e Controle dos Pais**: Acesso às configurações protegido por desafio matemático simples, cronômetro regressivo de 10 segundos para entregar o celular à criança e gerador de **Link Mágico** para abrir em outro aparelho ou enviar por e-mail.
+- **4 Motivos Criativos de Despedida**: Mamãe Noel chamando, duendes fazendo bagunça na fábrica, renas prontas no trenó e cartas urgentes no Polo Norte.
+
+## Público-Alvo
+- Pais, mães, avós, tios e responsáveis no Brasil buscando a melhor experiência online para o Papai Noel ligar por vídeo para seus filhos e crianças de 2 a 12 anos.
+
+## Recursos para Indexação
+- Aplicação Web Principal: /
+- Sitemap XML: /sitemap.xml
+- Regras de Rastreamento: /robots.txt
