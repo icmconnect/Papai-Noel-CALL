@@ -17,6 +17,7 @@ import {
   UserCheck,
   X,
 } from 'lucide-react';
+import {AdminScreen} from './components/AdminScreen';
 import {AudioMagicScreen} from './components/AudioMagicScreen';
 import {DebugPanel} from './components/DebugPanel';
 import {HomeScreen} from './components/HomeScreen';
@@ -189,8 +190,28 @@ function getFarewellSummaryText(farewellType: FarewellType): string {
 }
 
 export default function App() {
+  const isAdminRoute = typeof window !== 'undefined' && window.location.pathname === '/admin';
   const isDebugRoute = typeof window !== 'undefined' && window.location.pathname === '/debug-call';
   const isDebugTtsRoute = typeof window !== 'undefined' && window.location.pathname === '/debug-tts';
+
+  if (isAdminRoute) {
+    const initialAdminToken =
+      typeof window !== 'undefined'
+        ? new URLSearchParams(window.location.search).get('token')
+        : null;
+    return (
+      <div className="min-h-[100dvh] bg-[#0B0C10] text-[#F7F4EC] relative overflow-x-hidden">
+        <SnowfallBackground />
+        <OfflineIndicator />
+        <AdminScreen
+          initialToken={initialAdminToken}
+          onBackHome={() => {
+            window.location.assign('/');
+          }}
+        />
+      </div>
+    );
+  }
 
   const [debugName, setDebugName] = useState('Vinicius');
   const [debugTtsLoading, setDebugTtsLoading] = useState(false);

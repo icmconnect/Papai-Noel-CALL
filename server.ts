@@ -500,6 +500,132 @@ function resolveSantaTtsVoice(requestedVoice?: string): string {
   return 'Algenib';
 }
 
+const TOP_BOY_NAMES = [
+  'Miguel',
+  'Arthur',
+  'Gael',
+  'Théo',
+  'Heitor',
+  'Ravi',
+  'Davi',
+  'Bernardo',
+  'Noah',
+  'Gabriel',
+  'Samuel',
+  'Pedro',
+  'Anthony',
+  'Isaac',
+  'Benício',
+  'Benjamin',
+  'Matheus',
+  'Lucas',
+  'Joaquim',
+  'Nicolas',
+  'Lucca',
+  'Lorenzo',
+  'Henrique',
+  'João',
+  'Rafael',
+  'Murilo',
+  'Levi',
+  'Guilherme',
+  'Vicente',
+  'Felipe',
+  'Bryan',
+  'Matteo',
+  'Bento',
+  'Gustavo',
+  'Pietro',
+  'Leonardo',
+  'Eduardo',
+  'Daniel',
+  'Enzo',
+  'Cauã',
+  'Caio',
+  'Kauan',
+  'César',
+  'Rodrigo',
+  'Tiago',
+  'Bruno',
+  'Vitor',
+  'Vinícius',
+  'André',
+  'Otávio',
+  'Augusto',
+  'Emanuel',
+  'Thomas',
+  'Yuri',
+  'Danilo',
+  'Igor',
+  'Alexandre',
+  'Fernando',
+  'Marcelo',
+  'Francisco',
+] as const;
+
+const TOP_GIRL_NAMES = [
+  'Helena',
+  'Alice',
+  'Laura',
+  'Maria',
+  'Sophia',
+  'Manuela',
+  'Maitê',
+  'Liz',
+  'Cecília',
+  'Isabella',
+  'Luísa',
+  'Eloá',
+  'Heloísa',
+  'Júlia',
+  'Ayla',
+  'Beatriz',
+  'Antonella',
+  'Maya',
+  'Valentina',
+  'Melissa',
+  'Lívia',
+  'Giovanna',
+  'Elisa',
+  'Clara',
+  'Lorena',
+  'Esther',
+  'Isadora',
+  'Sarah',
+  'Mariana',
+  'Yasmin',
+  'Catarina',
+  'Lavínia',
+  'Alícia',
+  'Lara',
+  'Olívia',
+  'Marina',
+  'Rebeca',
+  'Agatha',
+  'Letícia',
+  'Gabriela',
+  'Nicole',
+  'Bianca',
+  'Ana',
+  'Isabel',
+  'Rafaela',
+  'Carolina',
+  'Vitória',
+  'Milena',
+  'Pietra',
+  'Luna',
+  'Aurora',
+  'Stella',
+  'Bárbara',
+  'Amanda',
+  'Bruna',
+  'Camila',
+  'Fernanda',
+  'Juliana',
+  'Larissa',
+  'Natália',
+] as const;
+
 function normalizeAudioBankSlug(name: string): string {
   return name
     .normalize('NFD')
@@ -507,6 +633,82 @@ function normalizeAudioBankSlug(name: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '');
+}
+
+const TOP_NAMES: readonly string[] = (() => {
+  const seenSlugs = new Set<string>();
+  const unique: string[] = [];
+  for (const rawName of [...TOP_BOY_NAMES, ...TOP_GIRL_NAMES]) {
+    const clean = rawName.trim();
+    const slug = normalizeAudioBankSlug(clean);
+    if (!clean || !slug || seenSlugs.has(slug)) continue;
+    seenSlugs.add(slug);
+    unique.push(clean);
+  }
+  return unique;
+})();
+
+function getAudioBankDirectory(): string {
+  return path.resolve(__dirname, 'public', 'audio', 'bank');
+}
+
+function listAudioBankFiles(): Array<{
+  filename: string;
+  sizeBytes: number;
+  updatedAt: string;
+  url: string;
+}> {
+  const bankDir = getAudioBankDirectory();
+  if (!fs.existsSync(bankDir)) return [];
+  const entries = fs.readdirSync(bankDir);
+  const files: Array<{filename: string; sizeBytes: number; updatedAt: string; url: string}> = [];
+  for (const entry of entries) {
+    if (!/\.(wav|mp3)$/i.test(entry)) continue;
+    const safeName = path.basename(entry);
+    const fullPath = path.resolve(bankDir, safeName);
+    if (!fullPath.startsWith(bankDir + path.sep)) continue;
+    try {
+      const stat = fs.statSync(fullPath);
+      if (!stat.isFile()) continue;
+      files.push({
+        filename: safeName,
+        sizeBytes: stat.size,
+        updatedAt: stat.mtime.toISOString(),
+        url: `/audio/bank/${encodeURIComponent(safeName)}`,
+      });
+    } catch {
+      // Ignore unreadable entry
+    }
+  }
+  return files.sort((a, b) => a.filename.localeCompare(b.filename));
+}
+
+function requireAdminToken(req: Request, res: Response): boolean {
+  const expectedToken = (process.env.ADMIN_TOKEN || '').trim();
+  const providedToken = (req.get('x-admin-token') || '').trim();
+  if (!expectedToken || !providedToken || !timingSafeStringEqual(providedToken, expectedToken)) {
+    res.status(401).json({error: 'Token de administrador ausente ou inválido.'});
+    return false;
+  }
+  return true;
+}
+
+async function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (ms <= 0) return;
+  if (signal?.aborted) {
+    throw new Error('ABORTED: Requisição cancelada pelo cliente.');
+  }
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error('ABORTED: Requisição cancelada pelo cliente.'));
+    };
+    signal?.addEventListener('abort', onAbort, {once: true});
+  });
 }
 
 function lookupDiskAudioBank(
@@ -2213,6 +2415,316 @@ async function startServer() {
     res.json(result);
   });
 
+  app.get('/api/admin/bank/list', (req: Request, res: Response) => {
+    if (!requireAdminToken(req, res)) return;
+    const files = listAudioBankFiles();
+    res.json({
+      files,
+      total: files.length,
+    });
+  });
+
+  app.post('/api/admin/bank/generate', async (req: Request, res: Response) => {
+    if (!requireAdminToken(req, res)) return;
+
+    const {controller: routeAbortController, cleanup: cleanupDisconnectListeners} =
+      createRequestAbortController(req, res);
+
+    try {
+      const body = (req.body || {}) as {overwrite?: boolean};
+      const overwrite = Boolean(body.overwrite);
+      const bankDir = getAudioBankDirectory();
+      fs.mkdirSync(bankDir, {recursive: true});
+
+      const genericClips: Array<{filename: string; text: string}> = [
+        {
+          filename: 'ola_generico.wav',
+          text: prepareSantaSpeechScript(
+            'Olá! Que alegria enorme ver você aqui na nossa chamada mágica do Polo Norte!',
+            180
+          ),
+        },
+        {
+          filename: 'ponte_generica.wav',
+          text: prepareSantaSpeechScript(
+            'Continue sendo uma criança tão especial... qual presente você mais quer ganhar neste Natal?',
+            180
+          ),
+        },
+        {
+          filename: 'despedida_mamae.wav',
+          text: prepareSantaSpeechScript(
+            'A Mamãe Noel está me chamando para tomar leite quentinho! Um beijo e Feliz Natal!',
+            180
+          ),
+        },
+        {
+          filename: 'despedida_duendes.wav',
+          text: prepareSantaSpeechScript(
+            'Os duendes estão fazendo a maior bagunça na fábrica! Um abraço e Feliz Natal!',
+            180
+          ),
+        },
+        {
+          filename: 'despedida_renas.wav',
+          text: prepareSantaSpeechScript(
+            'O Rodolfo e as renas já estão prontos no trenó para decolar! Feliz Natal!',
+            180
+          ),
+        },
+        {
+          filename: 'despedida_carta.wav',
+          text: prepareSantaSpeechScript(
+            'Chegou uma pilha mágica de cartinhas urgentes no Polo Norte! Feliz Natal!',
+            180
+          ),
+        },
+      ];
+
+      const nameClips: Array<{filename: string; text: string}> = TOP_NAMES.map((name) => {
+        const slug = normalizeAudioBankSlug(name);
+        return {
+          filename: `ola_${slug}.wav`,
+          text: prepareSantaSpeechScript(
+            `Olá, ${name}! Que alegria enorme ver você aqui na nossa chamada do Polo Norte...`,
+            180
+          ),
+        };
+      });
+
+      const allClips = [...genericClips, ...nameClips];
+      let gerados = 0;
+      let pulados = 0;
+      let falhas = 0;
+      const failures: Array<{filename: string; reason: string}> = [];
+      let didSynthesizeBefore = false;
+
+      for (const clip of allClips) {
+        if (routeAbortController.signal.aborted || res.writableEnded) {
+          break;
+        }
+
+        const safeFilename = path.basename(clip.filename);
+        const targetPath = path.resolve(bankDir, safeFilename);
+        if (!targetPath.startsWith(bankDir + path.sep)) {
+          falhas += 1;
+          failures.push({filename: clip.filename, reason: 'Caminho inválido.'});
+          continue;
+        }
+
+        if (!overwrite && fs.existsSync(targetPath)) {
+          try {
+            const stat = fs.statSync(targetPath);
+            if (stat.isFile() && stat.size > 500) {
+              pulados += 1;
+              continue;
+            }
+          } catch {
+            // Re-generate unreadable file
+          }
+        }
+
+        if (didSynthesizeBefore) {
+          try {
+            await abortableSleep(300, routeAbortController.signal);
+          } catch {
+            break;
+          }
+        }
+        didSynthesizeBefore = true;
+
+        const synth = await synthesizeSantaVoice(
+          clip.text,
+          undefined,
+          DEFAULT_GEMINI_TTS_MODEL,
+          routeAbortController.signal
+        );
+
+        if (routeAbortController.signal.aborted) {
+          break;
+        }
+
+        if (!synth.audioBase64) {
+          falhas += 1;
+          failures.push({
+            filename: safeFilename,
+            reason: synth.ttsError || 'Falha na síntese TTS.',
+          });
+          continue;
+        }
+
+        try {
+          const buf = Buffer.from(synth.audioBase64, 'base64');
+          fs.writeFileSync(targetPath, buf);
+          gerados += 1;
+        } catch (writeErr) {
+          falhas += 1;
+          failures.push({
+            filename: safeFilename,
+            reason: writeErr instanceof Error ? writeErr.message : 'Erro ao gravar arquivo WAV.',
+          });
+        }
+      }
+
+      if (routeAbortController.signal.aborted || res.writableEnded) {
+        return;
+      }
+
+      const files = listAudioBankFiles();
+      res.json({
+        gerados,
+        pulados,
+        falhas,
+        totalSolicitados: allClips.length,
+        custoEstimadoBRL: Number((gerados * 0.012).toFixed(3)),
+        files,
+        failures,
+      });
+    } catch (err) {
+      if (routeAbortController.signal.aborted || isAbortError(err) || res.writableEnded) {
+        return;
+      }
+      res.status(500).json({error: extractReadableError(err)});
+    } finally {
+      cleanupDisconnectListeners();
+    }
+  });
+
+  app.get('/api/admin/overview', async (req: Request, res: Response) => {
+    if (!requireAdminToken(req, res)) return;
+
+    const paymentMap = new Map<
+      string,
+      {
+        paymentId: string;
+        planId: string;
+        status: string;
+        value?: number;
+        customerName?: string;
+        customerEmail?: string;
+        ref?: string;
+        verifiedAt?: string;
+        source: 'asaas-api' | 'webhook' | 'api' | 'both';
+      }
+    >();
+
+    for (const local of paidPayments.values()) {
+      paymentMap.set(local.paymentId, {
+        paymentId: local.paymentId,
+        planId: local.planId,
+        status: local.status,
+        value: local.value,
+        customerName: local.customerName,
+        customerEmail: local.customerEmail,
+        ref: local.ref,
+        verifiedAt: local.verifiedAt,
+        source: local.source,
+      });
+    }
+
+    const asaasApiKey = (process.env.ASAAS_API_KEY || '').trim();
+    let asaasError: string | null = null;
+
+    if (asaasApiKey) {
+      const abortCtrl = new AbortController();
+      const timeout = setTimeout(() => abortCtrl.abort(), 5000);
+      try {
+        const asaasRes = await fetch(`${getAsaasApiBaseUrl()}/payments?limit=50`, {
+          method: 'GET',
+          headers: {
+            access_token: asaasApiKey,
+            'User-Agent': 'aistudio-build',
+          },
+          signal: abortCtrl.signal,
+        });
+        if (!asaasRes.ok) {
+          asaasError = `HTTP ${asaasRes.status}`;
+        } else {
+          const json = (await asaasRes.json()) as {
+            data?: Array<{
+              id?: string;
+              status?: string;
+              value?: number;
+              description?: string;
+              externalReference?: string;
+              dateCreated?: string;
+              paymentDate?: string;
+            }>;
+          };
+          for (const item of json.data || []) {
+            const id = typeof item.id === 'string' ? item.id.trim() : '';
+            if (!id) continue;
+            const existing = paymentMap.get(id);
+            const inferredPlan = inferPlanIdFromPayment({
+              externalReference: item.externalReference,
+              description: item.description,
+              value: item.value,
+            });
+            const extractedRef = extractRefFromExternalReference(item.externalReference);
+            paymentMap.set(id, {
+              paymentId: id,
+              planId: existing?.planId || inferredPlan,
+              status: item.status || existing?.status || 'UNKNOWN',
+              value: typeof item.value === 'number' ? item.value : existing?.value,
+              customerName: existing?.customerName,
+              customerEmail: existing?.customerEmail,
+              ref: existing?.ref || extractedRef,
+              verifiedAt: existing?.verifiedAt || item.paymentDate || item.dateCreated,
+              source: existing ? existing.source : 'asaas-api',
+            });
+          }
+        }
+      } catch (err) {
+        asaasError = extractReadableError(err);
+      } finally {
+        clearTimeout(timeout);
+      }
+    }
+
+    const parents = Array.from(parentsMap.values()).map((account) => ({
+      ...buildParentStats(account),
+      createdAt: account.createdAt,
+      updatedAt: account.updatedAt,
+      magicsCount: account.magics.length,
+    }));
+
+    const referralRefs = new Set<string>([
+      ...Array.from(creditedPaymentsByRef.keys()),
+      ...Array.from(parentsMap.keys()),
+    ]);
+
+    const referrals = Array.from(referralRefs)
+      .map((refCode) => {
+        const paymentIds = Array.from(creditedPaymentsByRef.get(refCode) || []);
+        const conversions = paymentIds.length;
+        const account = parentsMap.get(refCode);
+        const creditsEarned = Math.floor(conversions / 5);
+        const creditsRedeemed = account?.creditsRedeemed || 0;
+        const availableCredits = Math.max(0, creditsEarned - creditsRedeemed);
+        return {
+          ref: refCode,
+          parentName: account?.name,
+          parentEmail: account?.email,
+          conversions,
+          creditsEarned,
+          creditsRedeemed,
+          availableCredits,
+          paymentIds,
+        };
+      })
+      .filter((row) => row.conversions > 0 || row.creditsRedeemed > 0);
+
+    res.json({
+      generatedAt: new Date().toISOString(),
+      asaasConfigured: Boolean(asaasApiKey),
+      asaasError,
+      payments: Array.from(paymentMap.values()),
+      parents,
+      referrals,
+      bankFiles: listAudioBankFiles(),
+    });
+  });
+
   // Voice Test Debug Endpoint with Disk & Composite-Key Memory Audio Bank + Gemini TTS
   app.get('/api/debug/tts', async (req: Request, res: Response) => {
     try {
@@ -3206,6 +3718,8 @@ REGRAS OBRIGATÓRIAS:
       res.status(500).json({error: message});
     }
   });
+
+  app.use('/audio/bank', express.static(getAudioBankDirectory()));
 
   if (!isProd) {
     const {createServer: createViteServer} = await import('vite');

@@ -162,3 +162,60 @@ export interface SavedMagicItem {
   token: string;
   createdAt: string;
 }
+
+export interface AudioBankFileItem {
+  filename: string;
+  sizeBytes: number;
+  updatedAt: string;
+  url: string;
+}
+
+export interface BankGenerateSummary {
+  gerados: number;
+  pulados: number;
+  falhas: number;
+  totalSolicitados: number;
+  custoEstimadoBRL: number;
+  files: AudioBankFileItem[];
+  failures: Array<{filename: string; reason: string}>;
+}
+
+export interface AdminPaymentRow {
+  paymentId: string;
+  planId: string;
+  status: string;
+  value?: number;
+  customerName?: string;
+  customerEmail?: string;
+  ref?: string;
+  verifiedAt?: string;
+  source: 'asaas-api' | 'webhook' | 'api' | 'both';
+}
+
+export interface AdminParentRow extends ParentProfileStats {
+  createdAt: string;
+  updatedAt: string;
+  magicsCount: number;
+}
+
+export interface AdminReferralRow {
+  ref: string;
+  parentName?: string;
+  parentEmail?: string;
+  conversions: number;
+  creditsEarned: number;
+  creditsRedeemed: number;
+  availableCredits: number;
+  paymentIds: string[];
+}
+
+export interface AdminOverviewResponse {
+  generatedAt: string;
+  asaasConfigured: boolean;
+  asaasError?: string | null;
+  payments: AdminPaymentRow[];
+  parents: AdminParentRow[];
+  referrals: AdminReferralRow[];
+  bankFiles: AudioBankFileItem[];
+}
+

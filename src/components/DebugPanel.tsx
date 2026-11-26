@@ -1,5 +1,20 @@
-import React, {useEffect, useState} from 'react';
-import {AlertTriangle, ArrowLeft, Loader2, Mic2, ShieldAlert, Sparkles, Volume2, VolumeX} from 'lucide-react';
+import React, {useCallback, useEffect, useState} from 'react';
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Database,
+  ExternalLink,
+  FileAudio,
+  KeyRound,
+  Loader2,
+  Mic2,
+  RefreshCw,
+  ShieldAlert,
+  Sparkles,
+  Volume2,
+  VolumeX,
+} from 'lucide-react';
+import {AudioBankFileItem, BankGenerateSummary} from '../types';
 import {playSantaAudio, stopCurrentSantaVoice, unlockAudioContext} from '../utils/audioEngine';
 
 interface DebugPanelProps {
@@ -42,6 +57,15 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({onBack}) => {
   const [playedEngine, setPlayedEngine] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<DebugTtsResponse | null>(null);
+
+  // Banco de Vozes (Admin Dev Tooling)
+  const [adminToken, setAdminToken] = useState('');
+  const [overwriteBank, setOverwriteBank] = useState(false);
+  const [bankFiles, setBankFiles] = useState<AudioBankFileItem[]>([]);
+  const [isLoadingBankList, setIsLoadingBankList] = useState(false);
+  const [isGeneratingBank, setIsGeneratingBank] = useState(false);
+  const [bankError, setBankError] = useState<string | null>(null);
+  const [bankSummary, setBankSummary] = useState<BankGenerateSummary | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -135,6 +159,66 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({onBack}) => {
     stopCurrentSantaVoice();
     setIsPlaying(false);
     onBack();
+  };
+
+  const handleLoadBankList = useCallback(async () => {
+    const token = adminToken.trim();
+    if (!token) {
+      setBankError('Informe o token de administrador (ADMIN_TOKEN) para consultar o banco.');
+      return;
+    }
+    setBankError(null);
+    setIsLoadingBankList(true);
+    try {
+      const res = await fetch('/api/admin/bank/list', {
+        method: 'GET',
+        headers: {
+          'x-admin-token': token,
+        },
+      });
+      const data = (await res.json()) as {files?: AudioBankFileItem[]; error?: string};
+      if (!res.ok) {
+        throw new Error(data.error || `Erro HTTP ${res.status}`);
+      }
+      setBankFiles(Array.isArray(data.files) ? data.files : []);
+    } catch (err) {
+      setBankError(err instanceof Error ? err.message : 'Erro ao listar arquivos do banco.');
+    } finally {
+      setIsLoadingBankList(false);
+    }
+  }, [adminToken]);
+
+  const handleGenerateBank = async () => {
+    const token = adminToken.trim();
+    if (!token) {
+      setBankError('Informe o token de administrador (ADMIN_TOKEN) antes de gerar o banco.');
+      return;
+    }
+    if (isGeneratingBank) return;
+    setBankError(null);
+    setIsGeneratingBank(true);
+    try {
+      const res = await fetch('/api/admin/bank/generate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-admin-token': token,
+        },
+        body: JSON.stringify({overwrite: overwriteBank}),
+      });
+      const data = (await res.json()) as BankGenerateSummary & {error?: string};
+      if (!res.ok) {
+        throw new Error(data.error || `Erro HTTP ${res.status}`);
+      }
+      setBankSummary(data);
+      if (Array.isArray(data.files)) {
+        setBankFiles(data.files);
+      }
+    } catch (err) {
+      setBankError(err instanceof Error ? err.message : 'Falha ao gerar Banco de Vozes.');
+    } finally {
+      setIsGeneratingBank(false);
+    }
   };
 
   const resolvedVoiceSource =
@@ -399,6 +483,214 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({onBack}) => {
             </div>
           </section>
         )}
+
+        {/* Banco de Vozes Section */}
+        <section
+          aria-label="Banco de Vozes"
+          className="rounded-3xl border border-[#D4AF37]/30 bg-gradient-to-b from-[#161822] to-[#101218] p-6 sm:p-8 shadow-[0_24px_64px_rgba(0,0,0,0.65)] space-y-6"
+        >
+          <div className="flex flex-wrap items-start justify-between gap-4 border-b border-white/10 pb-5">
+            <div className="space-y-1">
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-[#D4AF37]/15 border border-[#D4AF37]/40 text-xs font-semibold text-[#F5D97E]">
+                <Database className="w-3.5 h-3.5" aria-hidden="true" />
+                <span>Pré-geração em Disco · public/audio/bank</span>
+              </div>
+              <h2
+                className="text-xl sm:text-2xl font-semibold text-[#F7F4EC] pt-1"
+                style={{fontFamily: 'var(--font-display)'}}
+              >
+                Banco de Vozes
+              </h2>
+              <p className="text-sm text-[#A8A396]">
+                Gera saudações em WAV para os 120 nomes mais comuns do Brasil (IBGE) + 6 clipes
+                genéricos de chamada, com intervalo de 300ms entre sínteses.
+              </p>
+            </div>
+          </div>
+
+          <div className="rounded-2xl border border-amber-400/35 bg-amber-950/35 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="space-y-1">
+              <p className="text-xs font-bold uppercase tracking-wider text-amber-300">
+                Atenção de Cota & Faturamento Google Cloud
+              </p>
+              <p className="text-xs text-amber-100/90 leading-relaxed">
+                Para gerar ~126 áudios sem esbarrar no limite gratuito (3 RPM / 10 RPD),{' '}
+                <strong className="text-white">ative cartão + alerta de R$20</strong> antes de rodar em lote.
+              </p>
+            </div>
+            <a
+              href="https://console.cloud.google.com/billing"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="shrink-0 min-h-[40px] px-4 rounded-xl bg-amber-400 text-[#0B0C10] text-xs font-bold inline-flex items-center gap-1.5 hover:bg-amber-300 transition-colors"
+            >
+              <span>console.cloud.google.com/billing</span>
+              <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+            </a>
+          </div>
+
+          {bankError && (
+            <div
+              role="alert"
+              className="rounded-2xl border border-red-400/50 bg-red-950/70 px-4 py-3 text-sm text-red-100 flex items-start gap-2.5"
+            >
+              <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" aria-hidden="true" />
+              <span>{bankError}</span>
+            </div>
+          )}
+
+          <div className="space-y-4">
+            <div className="space-y-2">
+              <label htmlFor="debug-admin-token" className="block text-sm font-medium text-[#E5E0D4]">
+                Token Admin (`x-admin-token` / `ADMIN_TOKEN`)
+              </label>
+              <div className="relative">
+                <KeyRound
+                  className="w-4 h-4 text-[#A8A396] absolute left-3.5 top-1/2 -translate-y-1/2"
+                  aria-hidden="true"
+                />
+                <input
+                  id="debug-admin-token"
+                  type="password"
+                  value={adminToken}
+                  onChange={(e) => setAdminToken(e.target.value)}
+                  placeholder="Cole o ADMIN_TOKEN configurado no servidor"
+                  autoComplete="off"
+                  className="w-full min-h-[48px] pl-10 pr-4 rounded-xl bg-[#0B0C10] border border-white/15 text-sm text-white placeholder:text-[#6B7280] focus:outline-none focus:border-[#D4AF37]"
+                />
+              </div>
+            </div>
+
+            <label
+              htmlFor="debug-bank-overwrite"
+              className="flex items-center gap-2.5 text-xs text-[#C7C2B6] cursor-pointer"
+            >
+              <input
+                id="debug-bank-overwrite"
+                type="checkbox"
+                checked={overwriteBank}
+                onChange={(e) => setOverwriteBank(e.target.checked)}
+                className="h-4 w-4 accent-[#D4AF37] rounded cursor-pointer"
+              />
+              <span>Sobrescrever arquivos WAV já existentes no disco</span>
+            </label>
+
+            <div className="flex flex-col sm:flex-row gap-3">
+              <button
+                type="button"
+                onClick={handleGenerateBank}
+                disabled={isGeneratingBank}
+                className="flex-1 min-h-[50px] px-5 rounded-xl bg-gradient-to-r from-[#D4AF37] to-[#F3E5AB] text-[#0B0C10] font-bold text-sm flex items-center justify-center gap-2 hover:brightness-105 transition-all cursor-pointer disabled:opacity-60 disabled:cursor-wait"
+              >
+                {isGeneratingBank ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+                    <span>Gerando banco de vozes...</span>
+                  </>
+                ) : (
+                  <>
+                    <Database className="w-4 h-4" aria-hidden="true" />
+                    <span>Gerar banco (dev)</span>
+                  </>
+                )}
+              </button>
+
+              <button
+                type="button"
+                onClick={handleLoadBankList}
+                disabled={isLoadingBankList}
+                className="sm:w-48 min-h-[50px] px-5 rounded-xl border border-white/15 bg-[#0B0C10] text-sm font-semibold text-[#E5E0D4] flex items-center justify-center gap-2 hover:bg-white/5 cursor-pointer disabled:opacity-60"
+              >
+                {isLoadingBankList ? (
+                  <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+                ) : (
+                  <RefreshCw className="w-4 h-4" aria-hidden="true" />
+                )}
+                <span>Listar arquivos</span>
+              </button>
+            </div>
+          </div>
+
+          {bankSummary && (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-1">
+              <div className="rounded-2xl border border-emerald-500/30 bg-emerald-950/30 p-3.5">
+                <p className="text-[11px] uppercase tracking-wider text-emerald-300">Gerados</p>
+                <p className="text-xl font-bold text-white tabular-nums">{bankSummary.gerados}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-[#0B0C10] p-3.5">
+                <p className="text-[11px] uppercase tracking-wider text-[#A8A396]">Já existentes</p>
+                <p className="text-xl font-bold text-white tabular-nums">{bankSummary.pulados}</p>
+              </div>
+              <div className="rounded-2xl border border-red-500/30 bg-red-950/30 p-3.5">
+                <p className="text-[11px] uppercase tracking-wider text-red-300">Falhas</p>
+                <p className="text-xl font-bold text-white tabular-nums">{bankSummary.falhas}</p>
+              </div>
+              <div className="rounded-2xl border border-[#D4AF37]/35 bg-[#D4AF37]/10 p-3.5">
+                <p className="text-[11px] uppercase tracking-wider text-[#F5D97E]">Custo estimado</p>
+                <p className="text-xl font-bold text-[#F5D97E] tabular-nums">
+                  R$ {bankSummary.custoEstimadoBRL.toFixed(3).replace('.', ',')}
+                </p>
+              </div>
+            </div>
+          )}
+
+          {bankSummary && bankSummary.failures.length > 0 && (
+            <div className="rounded-2xl border border-red-400/30 bg-red-950/25 p-4 space-y-1.5">
+              <p className="text-xs font-semibold text-red-300">
+                Falhas registradas ({bankSummary.failures.length}):
+              </p>
+              <ul className="max-h-32 overflow-y-auto text-xs text-red-200/90 space-y-1">
+                {bankSummary.failures.map((f) => (
+                  <li key={f.filename}>
+                    <span className="font-mono">{f.filename}</span>: {f.reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          <div className="space-y-2.5">
+            <div className="flex items-center justify-between text-xs text-[#A8A396]">
+              <span className="font-semibold text-[#E5E0D4] flex items-center gap-1.5">
+                <FileAudio className="w-4 h-4 text-[#D4AF37]" aria-hidden="true" />
+                <span>Arquivos no banco ({bankFiles.length})</span>
+              </span>
+              <span>
+                Estimativa lote completo (126 áudios):{' '}
+                <strong className="text-[#F5D97E]">R$ {(126 * 0.012).toFixed(2).replace('.', ',')}</strong>
+              </span>
+            </div>
+
+            {bankFiles.length === 0 ? (
+              <p className="rounded-2xl border border-white/10 bg-[#0B0C10] p-4 text-xs text-[#8D887C]">
+                Nenhum arquivo listado ainda. Informe o token admin e clique em &ldquo;Listar
+                arquivos&rdquo; ou &ldquo;Gerar banco (dev)&rdquo;.
+              </p>
+            ) : (
+              <div className="max-h-64 overflow-y-auto rounded-2xl border border-white/10 bg-[#0B0C10] divide-y divide-white/5">
+                {bankFiles.map((file) => (
+                  <div
+                    key={file.filename}
+                    className="px-4 py-2.5 flex items-center justify-between gap-3 text-xs"
+                  >
+                    <span className="font-mono text-[#F7F4EC] truncate">{file.filename}</span>
+                    <div className="flex items-center gap-3 shrink-0 text-[#9CA3AF]">
+                      <span className="tabular-nums">{(file.sizeBytes / 1024).toFixed(1)} KB</span>
+                      <a
+                        href={file.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[#F5D97E] hover:underline"
+                      >
+                        Ouvir
+                      </a>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </section>
       </main>
     </div>
   );
