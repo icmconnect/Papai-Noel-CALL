@@ -58,11 +58,11 @@ O projeto é uma aplicação full-stack **React 19 + TypeScript + Tailwind CSS v
 │   │   └── bank/                   # Banco de áudios em disco (/audio/bank/ola_<slug>.wav|mp3 e clipes genéricos)
 │   │       └── README.md           # Instruções do diretório
 │   │
-│   └── videos/                     # Os 4 vídeos MP4 da chamada e home
-│       ├── santa-hello.mp4         # Fase inicial de saudação (até 3,5s)
-│       ├── santa-listening.mp4     # Vídeo de escuta (também fundo da HomeScreen)
-│       ├── santa-talking.mp4       # Vídeo de fala (loop com playbackRate = 1.05)
-│       └── santa-goodbye.mp4       # Vídeo de despedida (ativado em T-6s ou T-3s)
+│   └── videos/                     # Os 4 vídeos MP4 da chamada e home (todos ativos em disco)
+│       ├── santa-hello.mp4         # Fase inicial de saudação (4,8 MB — até 3,5s)
+│       ├── santa-listening.mp4     # Vídeo de escuta (8,6 MB — também fundo da HomeScreen)
+│       ├── santa-talking.mp4       # Vídeo de fala (9,1 MB — loop com playbackRate = 1.05)
+│       └── santa-goodbye.mp4       # Vídeo de despedida (12 MB — ativado em T-6s ou T-3s)
 │
 └── src/                            # Frontend React 19 + TypeScript + Tailwind v4
     ├── App.tsx                     # Orquestrador de telas, rotas (/admin, /debug-call, /debug-tts), checkout gate e sessão de pais

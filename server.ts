@@ -91,8 +91,13 @@ function getHmacSecret(): string {
 interface EntitlementPayload {
   pid: string;
   plan: PlanId;
+  planId?: PlanId;
+  childName?: string;
+  paid?: boolean;
   iat: number;
   exp: number;
+  expiresAt?: number;
+  debugAllPlans?: boolean;
   ref?: string;
 }
 
@@ -192,8 +197,17 @@ function signEntitlementToken(payload: EntitlementPayload): string {
   return `${encoded}.${sig}`;
 }
 
-function isPlanAuthorizedByToken(tokenPlan: PlanId, requiredPlan?: PlanId): boolean {
+function isDebugUnlockAllowed(): boolean {
+  return !isProd || (process.env.ENABLE_DEBUG_UNLOCK || '').trim().toLowerCase() === 'true';
+}
+
+function isPlanAuthorizedByToken(
+  tokenPlan: PlanId,
+  requiredPlan?: PlanId,
+  debugAllPlans?: boolean
+): boolean {
   if (!requiredPlan) return true;
+  if (debugAllPlans) return true;
   if (tokenPlan === requiredPlan) return true;
   if (requiredPlan === 'audio') return tokenPlan === 'audio';
   if (tokenPlan === 'familia') return true;
@@ -224,24 +238,35 @@ function verifyEntitlementToken(
 
   try {
     const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as Partial<EntitlementPayload>;
+    const resolvedPlan = (parsed.plan || parsed.planId) as PlanId | undefined;
+    const resolvedExp =
+      typeof parsed.exp === 'number'
+        ? parsed.exp
+        : typeof parsed.expiresAt === 'number'
+          ? parsed.expiresAt
+          : 0;
+
     if (
       !parsed ||
       typeof parsed.pid !== 'string' ||
       !parsed.pid ||
-      typeof parsed.plan !== 'string' ||
-      typeof parsed.exp !== 'number' ||
-      parsed.exp <= Date.now()
+      typeof resolvedPlan !== 'string' ||
+      resolvedExp <= Date.now()
     ) {
       return null;
     }
     const validPlans: PlanId[] = ['15s', '30s', '60s', 'familia', 'audio'];
-    if (!validPlans.includes(parsed.plan as PlanId)) {
+    if (!validPlans.includes(resolvedPlan)) {
       return null;
     }
-    if (!isPlanAuthorizedByToken(parsed.plan as PlanId, requiredPlan)) {
+    if (!isPlanAuthorizedByToken(resolvedPlan, requiredPlan, Boolean(parsed.debugAllPlans))) {
       return null;
     }
-    return parsed as EntitlementPayload;
+    return {
+      ...(parsed as EntitlementPayload),
+      plan: resolvedPlan,
+      exp: resolvedExp,
+    };
   } catch {
     return null;
   }
@@ -1988,7 +2013,11 @@ async function startServer() {
       valid: true,
       pid: validPayload.pid,
       planId: validPayload.plan,
+      paid: validPayload.paid ?? true,
+      childName: validPayload.childName,
       exp: validPayload.exp,
+      expiresAt: validPayload.expiresAt ?? validPayload.exp,
+      debug: Boolean(validPayload.debugAllPlans),
       ref: validPayload.ref,
     });
   });
@@ -2722,6 +2751,80 @@ async function startServer() {
       parents,
       referrals,
       bankFiles: listAudioBankFiles(),
+    });
+  });
+
+  // Global Debug Mode Status & Unlock Routes (for testing without Asaas checkout in dev)
+  app.get('/api/debug/status', (_req: Request, res: Response) => {
+    const hasEnv = (name: string): boolean => Boolean((process.env[name] || '').trim());
+    const configured: Record<string, boolean> = {
+      GEMINI_API_KEY: getConfiguredApiKeys().length > 0,
+      SECRET: hasEnv('SECRET'),
+      ADMIN_TOKEN: hasEnv('ADMIN_TOKEN'),
+      ASAAS_API_KEY: hasEnv('ASAAS_API_KEY'),
+      ASAAS_WEBHOOK_TOKEN: hasEnv('ASAAS_WEBHOOK_TOKEN'),
+      ASAAS_LINK_15S: hasEnv('ASAAS_LINK_15S'),
+      ASAAS_LINK_30S: hasEnv('ASAAS_LINK_30S'),
+      ASAAS_LINK_60S: hasEnv('ASAAS_LINK_60S'),
+      ASAAS_LINK_FAMILIA: hasEnv('ASAAS_LINK_FAMILIA'),
+      ASAAS_LINK_AUDIO: hasEnv('ASAAS_LINK_AUDIO'),
+      RESEND_API_KEY: hasEnv('RESEND_API_KEY'),
+      OWNER_EMAIL: hasEnv('OWNER_EMAIL'),
+      APP_URL: hasEnv('APP_URL'),
+    };
+    const missingEnvVars = Object.entries(configured)
+      .filter(([, isSet]) => !isSet)
+      .map(([name]) => name);
+
+    res.json({
+      debugActive: isDebugUnlockAllowed(),
+      environment: isProd ? 'production' : 'development',
+      missingEnvVars,
+      configured,
+    });
+  });
+
+  app.post('/api/debug/unlock-all-plans', (req: Request, res: Response) => {
+    const expectedAdmin = (process.env.ADMIN_TOKEN || '').trim();
+    const providedAdmin = (req.get('x-admin-token') || '').trim();
+    const hasAdminOverride =
+      Boolean(expectedAdmin && providedAdmin && timingSafeStringEqual(providedAdmin, expectedAdmin));
+
+    if (!isDebugUnlockAllowed() && !hasAdminOverride) {
+      res.status(403).json({
+        error: 'Modo Debug Global desabilitado em produção.',
+      });
+      return;
+    }
+
+    const now = Date.now();
+    const expiresAt = now + 3600000;
+    const payload: EntitlementPayload = {
+      pid: `debug_${now}`,
+      plan: 'familia',
+      planId: 'familia',
+      childName: 'Teste Debug',
+      paid: true,
+      iat: now,
+      exp: expiresAt,
+      expiresAt,
+      debugAllPlans: true,
+    };
+    const token = signEntitlementToken(payload);
+
+    res.json({
+      ok: true,
+      token,
+      planId: payload.planId,
+      childName: payload.childName,
+      paid: payload.paid,
+      expiresAt: payload.expiresAt,
+      payload: {
+        planId: payload.planId,
+        childName: payload.childName,
+        paid: payload.paid,
+        expiresAt: payload.expiresAt,
+      },
     });
   });
 

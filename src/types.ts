@@ -219,3 +219,10 @@ export interface AdminOverviewResponse {
   bankFiles: AudioBankFileItem[];
 }
 
+export interface DebugStatusResponse {
+  debugActive: boolean;
+  environment: string;
+  missingEnvVars: string[];
+  configured: Record<string, boolean>;
+}
+

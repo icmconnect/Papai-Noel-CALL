@@ -30,6 +30,7 @@ import {
   AppScreen,
   AsaasPlanLinks,
   CallConfig,
+  DebugStatusResponse,
   FarewellType,
   PLANS,
   ParentProfileStats,
@@ -103,21 +104,57 @@ function decodeBase64UrlJson<T>(raw: string): T | null {
   }
 }
 
-function decodeMagicConfigFromUrl(): {config: CallConfig; token: string | null} | null {
+function decodeMagicConfigFromUrl(): {
+  config: CallConfig;
+  token: string | null;
+  isDebugUrl: boolean;
+} | null {
   if (typeof window === 'undefined') return null;
   const params = new URLSearchParams(window.location.search);
   const raw = params.get('chamada');
   if (!raw) return null;
 
+  const token = (params.get('token') || '').trim() || null;
+
+  if (raw === 'true') {
+    const validPlans: PlanId[] = ['15s', '30s', '60s', 'familia', 'audio'];
+    const requestedPlanRaw = (params.get('plano') || '').trim() as PlanId;
+    const requestedPlan = validPlans.includes(requestedPlanRaw) ? requestedPlanRaw : null;
+
+    let pendingConfig: Partial<CallConfig> = {};
+    try {
+      const rawPending = sessionStorage.getItem(PENDING_CHECKOUT_KEY);
+      if (rawPending) {
+        const parsedPending = JSON.parse(rawPending) as {config?: Partial<CallConfig>};
+        if (parsedPending?.config) {
+          pendingConfig = parsedPending.config;
+        }
+      }
+    } catch {
+      // Ignore storage errors
+    }
+
+    return {
+      config: {
+        ...DEFAULT_CONFIG,
+        ...pendingConfig,
+        planId: requestedPlan || pendingConfig.planId || 'familia',
+        childName: (pendingConfig.childName || '').trim() || 'Teste Debug',
+      },
+      token,
+      isDebugUrl: true,
+    };
+  }
+
   const parsed = decodeBase64UrlJson<Partial<CallConfig> & {token?: string}>(raw);
   if (!parsed?.childName) return null;
-  const token = (params.get('token') || parsed.token || '').trim() || null;
   return {
     config: {
       ...DEFAULT_CONFIG,
       ...parsed,
     },
-    token,
+    token: token || (parsed.token || '').trim() || null,
+    isDebugUrl: false,
   };
 }
 
@@ -339,6 +376,7 @@ export default function App() {
         config: audioFromUrl.config,
         isAudioLink: true,
         isVideoLink: false,
+        isDebugUrl: false,
         initialAudioText: audioFromUrl.audioText,
         linkToken: audioFromUrl.token,
         referrerId: storedRef || null,
@@ -353,6 +391,7 @@ export default function App() {
         config: fromUrl.config,
         isAudioLink: false,
         isVideoLink: true,
+        isDebugUrl: fromUrl.isDebugUrl,
         initialAudioText: undefined as string | undefined,
         linkToken: fromUrl.token,
         referrerId: storedRef || null,
@@ -387,6 +426,7 @@ export default function App() {
       config: restoredConfig,
       isAudioLink: false,
       isVideoLink: false,
+      isDebugUrl: false,
       initialAudioText: undefined as string | undefined,
       linkToken: null as string | null,
       referrerId: storedRef || null,
@@ -424,6 +464,10 @@ export default function App() {
     sourceType: 'audio' | 'video';
     reason: string;
   } | null>(null);
+  const [debugStatus, setDebugStatus] = useState<DebugStatusResponse | null>(null);
+  const [debugModeActive, setDebugModeActive] = useState<boolean>(false);
+  const [isTogglingDebug, setIsTogglingDebug] = useState<boolean>(false);
+  const [debugError, setDebugError] = useState<string | null>(null);
 
   const [parentProfile, setParentProfile] = useState<ParentProfileStats | null>(null);
   const [showPostPayRegister, setShowPostPayRegister] = useState<boolean>(false);
@@ -708,6 +752,13 @@ export default function App() {
       })
       .catch(() => undefined);
 
+    void fetch('/api/debug/status')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: DebugStatusResponse | null) => {
+        if (data) setDebugStatus(data);
+      })
+      .catch(() => undefined);
+
     void fetch('/api/parents/me')
       .then((r) => (r.ok ? r.json() : null))
       .then((data: {parent?: ParentProfileStats; magics?: SavedMagicItem[]} | null) => {
@@ -800,7 +851,13 @@ export default function App() {
               planId: initialState.config.planId,
             }),
           });
-          const data = (await res.json()) as {valid?: boolean; planId?: PlanId; error?: string};
+          const data = (await res.json()) as {
+            valid?: boolean;
+            planId?: PlanId;
+            debug?: boolean;
+            childName?: string;
+            error?: string;
+          };
           if (!res.ok || !data.valid || !data.planId) {
             setCheckoutGate({
               config: initialState.config,
@@ -813,8 +870,11 @@ export default function App() {
           setEntitlementToken(initialState.linkToken);
           entitlementTokenRef.current = initialState.linkToken;
           setPaidPlanId(data.planId);
+          if (data.debug) {
+            setDebugModeActive(true);
+          }
 
-          if (initialState.isAudioLink) {
+          if (initialState.isAudioLink || (initialState.isDebugUrl && initialState.config.planId === 'audio')) {
             screenRef.current = 'audio-magic';
             setScreen('audio-magic');
             void generateAudioMagicFromServer(
@@ -822,6 +882,11 @@ export default function App() {
               initialState.initialAudioText,
               initialState.linkToken
             );
+          } else if (initialState.isDebugUrl) {
+            setHasCustomConfig(true);
+            void prepareGreetingFromServer(initialState.config, initialState.linkToken);
+            screenRef.current = 'incoming';
+            setScreen('incoming');
           } else {
             setHasCustomConfig(true);
           }
@@ -839,6 +904,52 @@ export default function App() {
 
     void bootstrapTokenOrPayment();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleToggleDebugMode = useCallback(async (enable: boolean) => {
+    setDebugError(null);
+    if (!enable) {
+      setDebugModeActive(false);
+      setEntitlementToken(null);
+      entitlementTokenRef.current = null;
+      setPaidPlanId(null);
+      return;
+    }
+
+    setIsTogglingDebug(true);
+    try {
+      const res = await fetch('/api/debug/unlock-all-plans', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+      });
+      const data = (await res.json()) as {
+        ok?: boolean;
+        token?: string;
+        planId?: PlanId;
+        childName?: string;
+        error?: string;
+      };
+      if (!res.ok || !data.token) {
+        throw new Error(data.error || 'Não foi possível ativar o Modo Debug Global.');
+      }
+
+      setEntitlementToken(data.token);
+      entitlementTokenRef.current = data.token;
+      setPaidPlanId(data.planId || 'familia');
+      setDebugModeActive(true);
+      setPaymentConfirmError(null);
+      setCheckoutGate(null);
+      setConfig((prev) => ({
+        ...prev,
+        childName: prev.childName.trim() ? prev.childName : data.childName || 'Teste Debug',
+      }));
+    } catch (err) {
+      setDebugError(
+        err instanceof Error ? err.message : 'Erro ao ativar Modo Debug Global.'
+      );
+    } finally {
+      setIsTogglingDebug(false);
+    }
   }, []);
 
   const handleSubmitParentRegistration = async (e: React.FormEvent) => {
@@ -1075,10 +1186,21 @@ export default function App() {
     PLANS.find((p) => p.id === checkoutGate?.config.planId) || PLANS[3];
   const checkoutAsaasUrl = checkoutGate ? asaasLinks[checkoutGate.config.planId] : null;
 
+  const canUseDebugMode = import.meta.env.DEV || Boolean(debugStatus?.debugActive);
+
   return (
     <div className="min-h-[100dvh] bg-[#0B0C10] text-[#F7F4EC] relative overflow-x-hidden">
       <SnowfallBackground />
       <OfflineIndicator />
+
+      {debugModeActive && (
+        <div
+          role="status"
+          className="fixed top-2 left-1/2 -translate-x-1/2 z-[60] pointer-events-none px-3.5 py-1 rounded-full bg-red-600/95 border border-red-300 text-white text-[11px] font-extrabold uppercase tracking-wider shadow-[0_4px_18px_rgba(220,38,38,0.6)]"
+        >
+          MODO DEBUG ATIVO
+        </div>
+      )}
 
       {!isCallStageMounted && config.planId !== 'audio' && (
         <div
@@ -1709,6 +1831,14 @@ export default function App() {
           referrerId={referrerId}
           onOpenMyMagics={() => setScreen('my-magics')}
           onMagicLinkCreated={appendSavedMagic}
+          canUseDebugMode={canUseDebugMode}
+          debugModeActive={debugModeActive}
+          isTogglingDebug={isTogglingDebug}
+          debugMissingEnvVars={debugStatus?.missingEnvVars || []}
+          debugError={debugError}
+          onToggleDebugMode={(enable) => {
+            void handleToggleDebugMode(enable);
+          }}
         />
       )}
 

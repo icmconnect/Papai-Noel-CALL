@@ -38,12 +38,25 @@ interface ParentPanelProps {
   referrerId?: string | null;
   onOpenMyMagics?: () => void;
   onMagicLinkCreated?: (item: SavedMagicItem) => void;
+  canUseDebugMode?: boolean;
+  debugModeActive?: boolean;
+  isTogglingDebug?: boolean;
+  debugMissingEnvVars?: string[];
+  debugError?: string | null;
+  onToggleDebugMode?: (enable: boolean) => void;
 }
 
 const PENDING_CHECKOUT_STORAGE_KEY = 'santa_pending_checkout';
 
-function isPlanAuthorized(paidPlan: PlanId | null, token: string | null, targetPlan: PlanId): boolean {
-  if (!token || !paidPlan) return false;
+function isPlanAuthorized(
+  paidPlan: PlanId | null,
+  token: string | null,
+  targetPlan: PlanId,
+  debugModeActive?: boolean
+): boolean {
+  if (!token) return false;
+  if (debugModeActive) return true;
+  if (!paidPlan) return false;
   if (paidPlan === targetPlan) return true;
   if (targetPlan === 'audio') return paidPlan === 'audio';
   if (paidPlan === 'familia') return true;
@@ -77,6 +90,12 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
   referrerId,
   onOpenMyMagics,
   onMagicLinkCreated,
+  canUseDebugMode = false,
+  debugModeActive = false,
+  isTogglingDebug = false,
+  debugMissingEnvVars = [],
+  debugError = null,
+  onToggleDebugMode,
 }) => {
   const [magicLink, setMagicLink] = useState<string | null>(null);
   const [isSendingLink, setIsSendingLink] = useState(false);
@@ -105,12 +124,17 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
     onChange({...config, [key]: value});
   };
 
-  const persistPendingCheckout = (targetPlanId: PlanId) => {
+  const persistPendingCheckout = (targetPlanId: PlanId, fallbackName?: string) => {
     try {
+      const effectiveChildName = config.childName.trim() || fallbackName || '';
       sessionStorage.setItem(
         PENDING_CHECKOUT_STORAGE_KEY,
         JSON.stringify({
-          config: {...config, planId: targetPlanId},
+          config: {
+            ...config,
+            planId: targetPlanId,
+            ...(effectiveChildName ? {childName: effectiveChildName} : {}),
+          },
           ref: referrerId || undefined,
           savedAt: Date.now(),
         })
@@ -145,7 +169,10 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
       setLinkError('Preencha o nome da criança antes de gerar o link mágico.');
       return;
     }
-    if (!entitlementToken || !isPlanAuthorized(paidPlanId, entitlementToken, config.planId)) {
+    if (
+      !entitlementToken ||
+      !isPlanAuthorized(paidPlanId, entitlementToken, config.planId, debugModeActive)
+    ) {
       setLinkError('Faça o pagamento do plano selecionado para liberar a criação do Link Mágico.');
       return;
     }
@@ -199,7 +226,12 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
 
   const selectedPlan = PLANS.find((p) => p.id === config.planId) || PLANS[3];
   const isAudioPlan = selectedPlan.id === 'audio';
-  const isSelectedPlanPaid = isPlanAuthorized(paidPlanId, entitlementToken, selectedPlan.id);
+  const isSelectedPlanPaid = isPlanAuthorized(
+    paidPlanId,
+    entitlementToken,
+    selectedPlan.id,
+    debugModeActive
+  );
   const selectedAsaasUrl = asaasLinks[selectedPlan.id];
   const farewellSeconds = selectedPlan.durationSeconds <= 15 ? 3 : 6;
 
@@ -256,12 +288,35 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
       </header>
 
       <form onSubmit={handleStartCall} className="max-w-5xl mx-auto px-4 sm:px-8 py-8 space-y-10">
-        {(error || formError || checkoutNotice) && (
+        {debugModeActive && (
+          <div
+            role="status"
+            className="rounded-2xl border-2 border-red-500 bg-red-600/20 px-5 py-3.5 flex flex-wrap items-center justify-between gap-3 text-sm text-red-100 shadow-[0_0_24px_rgba(220,38,38,0.3)]"
+          >
+            <div className="flex items-center gap-2.5">
+              <span className="inline-flex items-center px-2.5 py-1 rounded-md bg-red-600 text-white text-xs font-extrabold uppercase tracking-wider">
+                MODO DEBUG ATIVO
+              </span>
+              <span className="text-xs sm:text-sm font-medium text-red-100">
+                Checkout Asaas ignorado para testes. Desative antes do deploy em produção.
+              </span>
+            </div>
+            {debugMissingEnvVars.length > 0 && (
+              <span className="text-[11px] font-mono text-red-200/90">
+                Variáveis ausentes ({debugMissingEnvVars.length}):{' '}
+                {debugMissingEnvVars.slice(0, 5).join(', ')}
+                {debugMissingEnvVars.length > 5 ? '...' : ''}
+              </span>
+            )}
+          </div>
+        )}
+
+        {(error || formError || checkoutNotice || debugError) && (
           <div
             role="alert"
             className="rounded-2xl border border-amber-400/40 bg-amber-950/50 px-5 py-4 text-sm text-amber-100"
           >
-            {formError || error || checkoutNotice}
+            {formError || debugError || error || checkoutNotice}
           </div>
         )}
 
@@ -269,16 +324,53 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
           <div className="rounded-2xl border border-emerald-400/40 bg-emerald-950/35 px-5 py-3.5 flex flex-wrap items-center justify-between gap-2 text-sm text-emerald-100">
             <span className="flex items-center gap-2 font-semibold">
               <Check className="w-4 h-4 text-emerald-400" aria-hidden="true" />
-              Pagamento confirmado · Plano liberado para usar!
+              {debugModeActive
+                ? 'Modo Debug Global liberado · Todos os planos desbloqueados para teste!'
+                : 'Pagamento confirmado · Plano liberado para usar!'}
             </span>
             <span className="text-xs text-emerald-300 uppercase tracking-wider font-semibold">
-              {PLANS.find((p) => p.id === paidPlanId)?.title || paidPlanId}
+              {debugModeActive
+                ? 'DEBUG (TODOS OS PLANOS)'
+                : PLANS.find((p) => p.id === paidPlanId)?.title || paidPlanId}
             </span>
           </div>
         )}
 
         {/* Section 1: 5 Planos com Checkout Asaas */}
         <section aria-labelledby="planos-heading" className="space-y-4">
+          {canUseDebugMode && onToggleDebugMode && (
+            <div className="rounded-2xl border border-white/15 bg-[#13151C] px-4 py-3.5 flex flex-wrap items-center justify-between gap-3">
+              <div className="space-y-0.5">
+                <span className="text-sm font-semibold text-[#F7F4EC] flex items-center gap-2">
+                  <span>🔓 Modo Teste (Sem Pagamento)</span>
+                </span>
+                <p className="text-xs text-[#A8A396]">
+                  Ative para gerar um token HMAC de teste e liberar todos os planos sem passar pelo
+                  Asaas.
+                </p>
+              </div>
+              <button
+                type="button"
+                role="switch"
+                aria-checked={debugModeActive}
+                aria-label="Modo Teste (Sem Pagamento)"
+                disabled={isTogglingDebug}
+                onClick={() => onToggleDebugMode(!debugModeActive)}
+                className={`relative inline-flex h-8 w-14 shrink-0 items-center rounded-full border transition-colors cursor-pointer disabled:opacity-60 ${
+                  debugModeActive
+                    ? 'bg-red-600 border-red-400'
+                    : 'bg-[#0B0C10] border-white/25 hover:border-white/40'
+                }`}
+              >
+                <span
+                  className={`inline-block h-6 w-6 transform rounded-full bg-white shadow transition-transform ${
+                    debugModeActive ? 'translate-x-7' : 'translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+          )}
+
           <div>
             <h2
               id="planos-heading"
@@ -288,8 +380,9 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
               1. Escolha o Plano da Ligação
             </h2>
             <p className="text-sm text-[#A8A396] mt-1">
-              Selecione a experiência ideal para sua família. Clique em &ldquo;Selecionar
-              plano&rdquo; para abrir o pagamento seguro via Asaas.
+              {debugModeActive
+                ? 'Modo Debug ativo: clique em "Selecionar plano" em qualquer card para abrir a chamada diretamente sem checkout.'
+                : 'Selecione a experiência ideal para sua família. Clique em "Selecionar plano" para abrir o pagamento seguro via Asaas.'}
             </p>
           </div>
 
@@ -298,8 +391,19 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
               const active = config.planId === plan.id;
               const isAnchoredBest = plan.id === 'familia';
               const isAudioIsca = plan.id === 'audio';
-              const unlocked = isPlanAuthorized(paidPlanId, entitlementToken, plan.id);
+              const unlocked = isPlanAuthorized(
+                paidPlanId,
+                entitlementToken,
+                plan.id,
+                debugModeActive
+              );
               const asaasUrl = asaasLinks[plan.id];
+              const debugDirectUrl =
+                debugModeActive && entitlementToken
+                  ? `/?chamada=true&plano=${encodeURIComponent(plan.id)}&token=${encodeURIComponent(
+                      entitlementToken
+                    )}`
+                  : null;
 
               return (
                 <div
@@ -381,7 +485,20 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                   </div>
 
                   <div className="flex items-center justify-between gap-2 pt-2.5 border-t border-white/8 text-xs">
-                    {unlocked ? (
+                    {debugDirectUrl ? (
+                      <a
+                        href={debugDirectUrl}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          updateField('planId', plan.id as PlanId);
+                          persistPendingCheckout(plan.id, 'Teste Debug');
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-500 text-[#0B0C10] font-bold hover:bg-emerald-400 transition-colors"
+                      >
+                        <Check className="w-3.5 h-3.5" aria-hidden="true" />
+                        <span>Selecionar plano</span>
+                      </a>
+                    ) : unlocked ? (
                       <span className="inline-flex items-center gap-1.5 text-emerald-300 font-semibold">
                         <Check className="w-4 h-4 text-emerald-400" aria-hidden="true" />
                         Plano liberado
