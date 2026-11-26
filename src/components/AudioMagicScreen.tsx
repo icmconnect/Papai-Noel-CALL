@@ -67,12 +67,57 @@ function appendRefParam(url: string, parentId?: string | null): string {
   }
 }
 
-function extractDomainLabel(url: string): string {
+function isInternalPreviewHostname(hostname: string): boolean {
+  const lower = hostname.toLowerCase();
+  return /^ais-(?:dev|pre)-/i.test(lower) && /\.run\.app$/i.test(lower);
+}
+
+function extractBaseDomainFromUrl(rawUrl: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return '';
   try {
-    return new URL(url).hostname;
+    const normalized = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+    return new URL(normalized).hostname;
   } catch {
-    return typeof window !== 'undefined' ? window.location.hostname : 'Polo Norte';
+    return '';
   }
+}
+
+function resolveCardDomainLabel(publicAppUrl?: string, shareUrl?: string): string {
+  const viteEnvAppUrl =
+    typeof import.meta !== 'undefined' && import.meta.env
+      ? ((import.meta.env as Record<string, string | undefined>).VITE_APP_URL || '').trim()
+      : '';
+
+  const candidates = [viteEnvAppUrl, publicAppUrl || '', shareUrl || ''].filter(Boolean);
+  for (const candidate of candidates) {
+    const host = extractBaseDomainFromUrl(candidate);
+    if (host && !isInternalPreviewHostname(host)) {
+      return host;
+    }
+  }
+
+  for (const candidate of candidates) {
+    const host = extractBaseDomainFromUrl(candidate);
+    if (host) {
+      return host;
+    }
+  }
+
+  if (typeof window !== 'undefined' && window.location.origin) {
+    return extractBaseDomainFromUrl(window.location.origin) || window.location.hostname || 'Polo Norte';
+  }
+  return 'Polo Norte';
+}
+
+function truncateMiddle(text: string, maxLength: number): string {
+  const clean = (text || '').trim();
+  if (clean.length <= maxLength || maxLength < 10) return clean;
+  const ellipsis = '...';
+  const remaining = maxLength - ellipsis.length;
+  const headLen = Math.ceil(remaining * 0.55);
+  const tailLen = Math.floor(remaining * 0.45);
+  return `${clean.slice(0, headLen)}${ellipsis}${clean.slice(clean.length - tailLen)}`;
 }
 
 function base64ToUint8Array(base64: string): Uint8Array {
@@ -208,8 +253,22 @@ async function generateSantaCardPngBlob(childName: string, domainLabel: string):
   ctx.font = '400 30px "Plus Jakarta Sans", system-ui, sans-serif';
   ctx.fillText('Guarde este recado mágico para ouvir sempre que quiser.', width / 2, 1010);
 
-  // Domain pill at bottom
-  const pillW = Math.min(820, Math.max(460, domainLabel.length * 20 + 120));
+  // Domain pill at bottom (generous lateral padding + middle truncation if long)
+  ctx.font = 'bold 28px "JetBrains Mono", monospace';
+  const pillPaddingX = 36;
+  const maxPillW = 900;
+  const maxTextW = maxPillW - pillPaddingX * 2;
+
+  let displayDomain = truncateMiddle(domainLabel, 42);
+  let textW = ctx.measureText(displayDomain).width;
+  let maxChars = displayDomain.length;
+  while (textW > maxTextW && maxChars > 14) {
+    maxChars -= 2;
+    displayDomain = truncateMiddle(domainLabel, maxChars);
+    textW = ctx.measureText(displayDomain).width;
+  }
+
+  const pillW = Math.min(maxPillW, Math.max(360, Math.ceil(textW + pillPaddingX * 2)));
   const pillH = 74;
   const pillX = (width - pillW) / 2;
   const pillY = 1140;
@@ -222,8 +281,7 @@ async function generateSantaCardPngBlob(childName: string, domainLabel: string):
   ctx.stroke();
 
   ctx.fillStyle = '#F5D97E';
-  ctx.font = 'bold 28px "JetBrains Mono", monospace';
-  ctx.fillText(domainLabel, width / 2, pillY + 47);
+  ctx.fillText(displayDomain, width / 2, pillY + 47);
 
   return await new Promise<Blob | null>((resolve) => {
     canvas.toBlob((blob) => resolve(blob), 'image/png');
@@ -278,7 +336,7 @@ export const AudioMagicScreen: React.FC<AudioMagicScreenProps> = ({
     [parentId, rawShareUrl]
   );
   const domainLabel = useMemo(
-    () => extractDomainLabel(publicAppUrl || shareUrl),
+    () => resolveCardDomainLabel(publicAppUrl, shareUrl),
     [publicAppUrl, shareUrl]
   );
 
