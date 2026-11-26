@@ -1,5 +1,5 @@
 import React, {useCallback, useEffect, useRef, useState} from 'react';
-import {AlertTriangle, CameraOff, Loader2, Mic, PhoneOff, RotateCcw} from 'lucide-react';
+import {AlertTriangle, Camera, CameraOff, Loader2, Mic, PhoneOff, RotateCcw} from 'lucide-react';
 import {CallConfig, ChatTurn, PLANS, PreparedCallMedia, SantaVideoState} from '../types';
 import {playSantaAudio, stopCurrentSantaVoice} from '../utils/audioEngine';
 
@@ -24,6 +24,13 @@ const SPEECH_ENTER_TALKING_THRESHOLD = 0.08;
 const SPEECH_EXIT_LISTENING_THRESHOLD = 0.03;
 const SPEECH_HOLD_MS = 400;
 const MIC_HOLD_MAX_MS = 10000;
+
+const SANTA_VIDEO_SOURCES: Record<SantaVideoState, string> = {
+  hello: '/videos/santa-hello.mp4',
+  talking: '/videos/santa-talking.mp4',
+  listening: '/videos/santa-listening.mp4',
+  goodbye: '/videos/santa-goodbye.mp4',
+};
 
 function arrayBufferToBase64(buffer: ArrayBuffer): string {
   const bytes = new Uint8Array(buffer);
@@ -179,6 +186,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   const [helloVideoFailed, setHelloVideoFailed] = useState<boolean>(false);
   const helloVideoFailedRef = useRef<boolean>(false);
   const [isAudioPlaying, setIsAudioPlaying] = useState<boolean>(false);
+  const [pipReady, setPipReady] = useState(false);
   const [pipVideoState, setPipVideoState] = useState<'waiting' | 'playing' | 'ended'>('waiting');
   const [isPipTrackUnavailable, setIsPipTrackUnavailable] = useState<boolean>(true);
   const [greetingError, setGreetingError] = useState<string | null>(null);
@@ -188,6 +196,18 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   const [isHoldingMic, setIsHoldingMic] = useState(false);
   const [isSendingReply, setIsSendingReply] = useState(false);
   const [statusNotice, setStatusNotice] = useState<string | null>(null);
+
+  const [activeBuffer, setActiveBuffer] = useState<'A' | 'B'>('A');
+  const [slotASrc, setSlotASrc] = useState<string>(SANTA_VIDEO_SOURCES.hello);
+  const [slotBSrc, setSlotBSrc] = useState<string>(SANTA_VIDEO_SOURCES.talking);
+
+  const videoARef = useRef<HTMLVideoElement | null>(null);
+  const videoBRef = useRef<HTMLVideoElement | null>(null);
+  const activeBufferRef = useRef<'A' | 'B'>('A');
+  const slotASrcRef = useRef<string>(SANTA_VIDEO_SOURCES.hello);
+  const slotBSrcRef = useRef<string>(SANTA_VIDEO_SOURCES.talking);
+  const transitionTokenRef = useRef<number>(0);
+  const preloadedVideosRef = useRef<HTMLVideoElement[]>([]);
 
   const childCamRef = useRef<HTMLVideoElement | null>(null);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
@@ -263,6 +283,55 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     };
   }, []);
 
+  // TASK 2.5: Pré-carregar todos os 4 vídeos no mount para evitar delay na troca A/B
+  useEffect(() => {
+    const urls = Object.values(SANTA_VIDEO_SOURCES);
+    const preloaded = urls.map((url) => {
+      const vid = document.createElement('video');
+      vid.preload = 'auto';
+      vid.muted = true;
+      vid.playsInline = true;
+      vid.src = url;
+      try {
+        vid.load();
+      } catch {
+        // Ignore preload error
+      }
+      return vid;
+    });
+    preloadedVideosRef.current = preloaded;
+
+    return () => {
+      preloaded.forEach((vid) => {
+        vid.removeAttribute('src');
+        try {
+          vid.load();
+        } catch {
+          // Ignore cleanup error
+        }
+      });
+      preloadedVideosRef.current = [];
+    };
+  }, []);
+
+  const attachVideoARef = useCallback(
+    (el: HTMLVideoElement | null) => {
+      videoARef.current = el;
+      helloVideoRef.current = el;
+      listeningVideoRef.current = el;
+    },
+    [helloVideoRef, listeningVideoRef]
+  );
+
+  const attachVideoBRef = useCallback(
+    (el: HTMLVideoElement | null) => {
+      videoBRef.current = el;
+      talkingVideoRef.current = el;
+      goodbyeVideoRef.current = el;
+    },
+    [goodbyeVideoRef, talkingVideoRef]
+  );
+
   const requestNewCameraStreamIfNeeded = useCallback(() => {
     if (
       !isCallActive ||
@@ -280,6 +349,23 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     void onRequestCameraStream();
   }, [isCallActive, onRequestCameraStream]);
 
+  // TASK 2.4: Timeout de segurança de 3000ms para pipReady (evita travamento permanente no skeleton)
+  useEffect(() => {
+    if (!isCallActive || !frontCameraStream) {
+      setPipReady(false);
+      return;
+    }
+    setPipReady(false);
+    const safetyTimer = window.setTimeout(() => {
+      if (mountedRef.current) {
+        setPipReady(true);
+      }
+    }, 3000);
+    return () => {
+      window.clearTimeout(safetyTimer);
+    };
+  }, [frontCameraStream, isCallActive]);
+
   // PIP local: monitora track ended/muted, re-attach + play ao reativar chamada e recuperação de stream morto
   useEffect(() => {
     const camEl = childCamRef.current;
@@ -288,6 +374,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       if (camEl) {
         camEl.srcObject = null;
       }
+      setPipReady(false);
       setPipVideoState('waiting');
       setIsPipTrackUnavailable(true);
       return;
@@ -297,6 +384,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       if (camEl) {
         camEl.srcObject = null;
       }
+      setPipReady(false);
       setPipVideoState('ended');
       setIsPipTrackUnavailable(true);
       return;
@@ -304,6 +392,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
 
     const videoTrack = frontCameraStream.getVideoTracks()[0] || null;
     if (!videoTrack || videoTrack.readyState === 'ended') {
+      setPipReady(false);
       setIsPipTrackUnavailable(true);
       setPipVideoState('ended');
       requestNewCameraStreamIfNeeded();
@@ -315,11 +404,15 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
 
     if (camEl) {
       camEl.srcObject = frontCameraStream;
+      if (camEl.readyState >= 2) {
+        setPipReady(true);
+      }
       camEl.play().catch(() => undefined);
     }
 
     const handleTrackEnded = () => {
       if (!mountedRef.current) return;
+      setPipReady(false);
       setIsPipTrackUnavailable(true);
       setPipVideoState('ended');
       requestNewCameraStreamIfNeeded();
@@ -567,11 +660,112 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     }, 180);
   }, [farewellThresholdSeconds, plan.interactive]);
 
+  const effectiveVideoState: SantaVideoState =
+    videoState === 'hello' && helloVideoFailed ? 'talking' : videoState;
+  const desiredVideoSrc = SANTA_VIDEO_SOURCES[effectiveVideoState];
+
+  // TASK 2.5: Controlador de crossfade A/B entre os 4 clipes sem afetar o áudio
   useEffect(() => {
-    if (talkingVideoRef.current) {
-      talkingVideoRef.current.playbackRate = 1.05;
+    if (!isCallActive) {
+      transitionTokenRef.current += 1;
+      activeBufferRef.current = 'A';
+      setActiveBuffer('A');
+      slotASrcRef.current = SANTA_VIDEO_SOURCES.hello;
+      slotBSrcRef.current = SANTA_VIDEO_SOURCES.talking;
+      setSlotASrc(SANTA_VIDEO_SOURCES.hello);
+      setSlotBSrc(SANTA_VIDEO_SOURCES.talking);
+      return;
     }
-  }, [isCallActive, talkingVideoRef, videoState]);
+
+    const currentBuf = activeBufferRef.current;
+    const currentSrc = currentBuf === 'A' ? slotASrcRef.current : slotBSrcRef.current;
+    const currentEl = currentBuf === 'A' ? videoARef.current : videoBRef.current;
+    const targetRate = effectiveVideoState === 'talking' ? 1.05 : 1.0;
+
+    if (currentSrc === desiredVideoSrc) {
+      if (currentEl) {
+        currentEl.playbackRate = targetRate;
+        currentEl.play().catch(() => undefined);
+      }
+      return;
+    }
+
+    const nextBuf: 'A' | 'B' = currentBuf === 'A' ? 'B' : 'A';
+    const token = ++transitionTokenRef.current;
+
+    if (nextBuf === 'A') {
+      slotASrcRef.current = desiredVideoSrc;
+      setSlotASrc(desiredVideoSrc);
+    } else {
+      slotBSrcRef.current = desiredVideoSrc;
+      setSlotBSrc(desiredVideoSrc);
+    }
+
+    let safetyTimer: number | null = null;
+    let rafId: number | null = null;
+    let cleanedUp = false;
+    let boundEl: HTMLVideoElement | null = null;
+
+    const commitSwap = () => {
+      if (cleanedUp || !mountedRef.current || transitionTokenRef.current !== token) {
+        return;
+      }
+      cleanedUp = true;
+      if (safetyTimer !== null) {
+        window.clearTimeout(safetyTimer);
+        safetyTimer = null;
+      }
+      const nextEl = nextBuf === 'A' ? videoARef.current : videoBRef.current;
+      if (nextEl) {
+        nextEl.playbackRate = targetRate;
+        nextEl.play().catch(() => undefined);
+      }
+      activeBufferRef.current = nextBuf;
+      setActiveBuffer(nextBuf);
+    };
+
+    const handleReady = () => {
+      commitSwap();
+    };
+
+    rafId = window.requestAnimationFrame(() => {
+      if (cleanedUp || transitionTokenRef.current !== token) return;
+      const nextEl = nextBuf === 'A' ? videoARef.current : videoBRef.current;
+      if (!nextEl) {
+        commitSwap();
+        return;
+      }
+      boundEl = nextEl;
+      nextEl.playbackRate = targetRate;
+      if (effectiveVideoState === 'hello' || effectiveVideoState === 'goodbye') {
+        try {
+          nextEl.currentTime = 0;
+        } catch {
+          // Ignore seek errors before metadata
+        }
+      }
+      nextEl.play().catch(() => undefined);
+
+      if (nextEl.readyState >= 2) {
+        commitSwap();
+        return;
+      }
+
+      nextEl.addEventListener('loadeddata', handleReady, {once: true});
+      nextEl.addEventListener('canplay', handleReady, {once: true});
+      safetyTimer = window.setTimeout(commitSwap, 160);
+    });
+
+    return () => {
+      cleanedUp = true;
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+      if (safetyTimer !== null) window.clearTimeout(safetyTimer);
+      if (boundEl) {
+        boundEl.removeEventListener('loadeddata', handleReady);
+        boundEl.removeEventListener('canplay', handleReady);
+      }
+    };
+  }, [desiredVideoSrc, effectiveVideoState, isCallActive]);
 
   /**
    * Gate com memória (EMA + histerese + hold de 400ms):
@@ -626,29 +820,6 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     setCallPhase('hello');
     setVideoState('hello');
 
-    if (helloVideoRef.current && !helloVideoFailedRef.current) {
-      try {
-        helloVideoRef.current.currentTime = 0;
-        helloVideoRef.current.play().catch(() => {
-          helloVideoFailedRef.current = true;
-          setHelloVideoFailed(true);
-        });
-      } catch {
-        helloVideoFailedRef.current = true;
-        setHelloVideoFailed(true);
-      }
-    }
-
-    if (talkingVideoRef.current) {
-      try {
-        talkingVideoRef.current.playbackRate = 1.05;
-        talkingVideoRef.current.currentTime = 0;
-        talkingVideoRef.current.play().catch(() => undefined);
-      } catch {
-        // Ignore
-      }
-    }
-
     helloTimeoutRef.current = window.setTimeout(() => {
       helloTimeoutRef.current = null;
       if (
@@ -665,7 +836,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
       const shouldTalk = isAudioPlayingRef.current && isGateTalkingRef.current;
       setVideoState(shouldTalk ? 'talking' : 'listening');
     }, 3500);
-  }, [helloVideoRef, talkingVideoRef]);
+  }, []);
 
   const triggerBridgePhase = useCallback(async () => {
     if (
@@ -1297,14 +1468,6 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
         resetSpeechGate();
 
         setVideoState('goodbye');
-        if (goodbyeVideoRef.current) {
-          try {
-            goodbyeVideoRef.current.currentTime = 0;
-            goodbyeVideoRef.current.play().catch(() => undefined);
-          } catch {
-            // Ignore
-          }
-        }
 
         void triggerFarewellPhase();
       }
@@ -1334,7 +1497,6 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     config.planId,
     farewellThresholdSeconds,
     finishCallSafely,
-    goodbyeVideoRef,
     pauseWallClockTimer,
     plan.durationSeconds,
     resetSpeechGate,
@@ -1441,24 +1603,19 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     setTimeLeft(plan.durationSeconds);
     setVideoState('hello');
 
-    if (helloVideoRef.current && !helloVideoFailedRef.current) {
+    if (videoARef.current && !helloVideoFailedRef.current) {
       try {
-        helloVideoRef.current.currentTime = 0;
-        helloVideoRef.current.play().catch(() => {
-          helloVideoFailedRef.current = true;
-          setHelloVideoFailed(true);
-        });
+        videoARef.current.currentTime = 0;
+        videoARef.current.play().catch(() => undefined);
       } catch {
-        helloVideoFailedRef.current = true;
-        setHelloVideoFailed(true);
+        // Ignore
       }
     }
 
-    if (talkingVideoRef.current) {
+    if (videoBRef.current) {
       try {
-        talkingVideoRef.current.playbackRate = 1.05;
-        talkingVideoRef.current.currentTime = 0;
-        talkingVideoRef.current.play().catch(() => undefined);
+        videoBRef.current.playbackRate = 1.05;
+        videoBRef.current.play().catch(() => undefined);
       } catch {
         // Ignore
       }
@@ -1529,14 +1686,12 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
   }, [
     cleanupAllDevices,
     clearStatusNotice,
-    helloVideoRef,
     isCallActive,
     pauseWallClockTimer,
     plan.durationSeconds,
     playGenericBankGreetingClip,
     retryNonce,
     startWallClockTimer,
-    talkingVideoRef,
   ]);
 
   // Se prepareError ocorrer antes dos 4s, tenta banco (.mp3 e .wav); se faltar, exibe card de erro imediatamente
@@ -2094,9 +2249,6 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
     callPhase !== 'ending' &&
     (isHoldingMic || isSpeechListening || (plan.interactive && timeLeft > farewellThresholdSeconds));
 
-  const isHelloVisualActive = videoState === 'hello' && !helloVideoFailed;
-  const isTalkingVisualActive =
-    videoState === 'talking' || (videoState === 'hello' && helloVideoFailed);
   const isFarewellVisualPhase = callPhase === 'farewell' || callPhase === 'ending';
   const showPipOffPlaceholder =
     !frontCameraStream || isPipTrackUnavailable || pipVideoState === 'ended';
@@ -2118,42 +2270,10 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
           />
         </div>
 
-        {/* Overlapping <video> Elements with object-cover scale-105 & smooth 500ms Opacity Crossfade */}
+        {/* TASK 2.5: Dois elementos <video> sobrepostos (videoA e videoB) com crossfade 500ms ease-in-out */}
         <video
-          ref={helloVideoRef}
-          src="/videos/santa-hello.mp4"
-          poster="/santa-avatar.png"
-          loop
-          muted
-          playsInline
-          autoPlay
-          preload="auto"
-          onError={() => {
-            helloVideoFailedRef.current = true;
-            setHelloVideoFailed(true);
-          }}
-          className={`absolute inset-0 w-full h-full object-cover scale-105 pointer-events-none transition-opacity duration-500 ease-in-out ${
-            isHelloVisualActive ? 'z-[12] opacity-100' : 'z-10 opacity-0'
-          }`}
-        />
-
-        <video
-          ref={listeningVideoRef}
-          src="/videos/santa-listening.mp4"
-          poster="/santa-avatar.png"
-          loop
-          muted
-          playsInline
-          autoPlay
-          preload="auto"
-          className={`absolute inset-0 w-full h-full object-cover scale-105 pointer-events-none transition-opacity duration-500 ease-in-out ${
-            videoState === 'listening' ? 'z-[12] opacity-100' : 'z-10 opacity-0'
-          }`}
-        />
-
-        <video
-          ref={talkingVideoRef}
-          src="/videos/santa-talking.mp4"
+          ref={attachVideoARef}
+          src={slotASrc}
           poster="/santa-avatar.png"
           loop
           muted
@@ -2161,26 +2281,47 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
           autoPlay
           preload="auto"
           onLoadedMetadata={(e) => {
-            e.currentTarget.playbackRate = 1.05;
+            e.currentTarget.playbackRate = slotASrc === SANTA_VIDEO_SOURCES.talking ? 1.05 : 1.0;
           }}
           onPlay={(e) => {
-            e.currentTarget.playbackRate = 1.05;
+            e.currentTarget.playbackRate = slotASrc === SANTA_VIDEO_SOURCES.talking ? 1.05 : 1.0;
           }}
-          className={`absolute inset-0 w-full h-full object-cover scale-105 pointer-events-none transition-opacity duration-500 ease-in-out ${
-            isTalkingVisualActive ? 'z-[12] opacity-100' : 'z-10 opacity-0'
+          onError={() => {
+            if (slotASrcRef.current === SANTA_VIDEO_SOURCES.hello) {
+              helloVideoFailedRef.current = true;
+              setHelloVideoFailed(true);
+            }
+          }}
+          style={{transition: 'opacity 500ms ease-in-out'}}
+          className={`absolute inset-0 w-full h-full object-cover scale-105 pointer-events-none ${
+            activeBuffer === 'A' ? 'z-[12] opacity-100' : 'z-10 opacity-0'
           }`}
         />
 
         <video
-          ref={goodbyeVideoRef}
-          src="/videos/santa-goodbye.mp4"
+          ref={attachVideoBRef}
+          src={slotBSrc}
           poster="/santa-avatar.png"
           loop
           muted
           playsInline
+          autoPlay
           preload="auto"
-          className={`absolute inset-0 w-full h-full object-cover scale-105 pointer-events-none transition-opacity duration-500 ease-in-out ${
-            videoState === 'goodbye' ? 'z-[12] opacity-100' : 'z-10 opacity-0'
+          onLoadedMetadata={(e) => {
+            e.currentTarget.playbackRate = slotBSrc === SANTA_VIDEO_SOURCES.talking ? 1.05 : 1.0;
+          }}
+          onPlay={(e) => {
+            e.currentTarget.playbackRate = slotBSrc === SANTA_VIDEO_SOURCES.talking ? 1.05 : 1.0;
+          }}
+          onError={() => {
+            if (slotBSrcRef.current === SANTA_VIDEO_SOURCES.hello) {
+              helloVideoFailedRef.current = true;
+              setHelloVideoFailed(true);
+            }
+          }}
+          style={{transition: 'opacity 500ms ease-in-out'}}
+          className={`absolute inset-0 w-full h-full object-cover scale-105 pointer-events-none ${
+            activeBuffer === 'B' ? 'z-[12] opacity-100' : 'z-10 opacity-0'
           }`}
         />
 
@@ -2204,7 +2345,7 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
             </p>
           </div>
 
-          {/* Child Front Camera Picture-in-Picture with Golden Christmas Glow Frame */}
+          {/* TASK 2.4: Child Front Camera PiP with skeleton while !pipReady + 3s timeout */}
           <div className="w-24 h-32 sm:w-28 sm:h-36 rounded-2xl p-[2px] bg-gradient-to-br from-[#FCE8A6] via-[#D4AF37] to-[#8C6812] shadow-[0_0_26px_rgba(212,175,55,0.45)] ring-1 ring-[#F5D97E]/40 shrink-0 relative">
             <div className="w-full h-full rounded-[14px] overflow-hidden bg-[#13151C]/95 relative">
               {frontCameraStream && (
@@ -2213,8 +2354,10 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
                   autoPlay
                   muted
                   playsInline
+                  onLoadedData={() => setPipReady(true)}
                   onPlaying={() => {
                     setPipVideoState('playing');
+                    setPipReady(true);
                     const track = frontCameraStream.getVideoTracks()[0];
                     if (track && track.readyState === 'live' && !track.muted && track.enabled) {
                       setIsPipTrackUnavailable(false);
@@ -2222,12 +2365,13 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
                   }}
                   onWaiting={() => setPipVideoState('waiting')}
                   onEnded={() => {
+                    setPipReady(false);
                     setPipVideoState('ended');
                     setIsPipTrackUnavailable(true);
                     requestNewCameraStreamIfNeeded();
                   }}
                   className={`w-full h-full object-cover scale-x-[-1] transition-opacity duration-200 ${
-                    showPipOffPlaceholder ? 'opacity-0' : 'opacity-100'
+                    showPipOffPlaceholder || !pipReady ? 'opacity-0' : 'opacity-100'
                   }`}
                 />
               )}
@@ -2241,9 +2385,9 @@ export const VideoCallScreen: React.FC<VideoCallScreenProps> = ({
                 </div>
               )}
 
-              {!showPipOffPlaceholder && pipVideoState === 'waiting' && (
-                <div className="absolute inset-0 flex items-center justify-center bg-[#13151C]/60 pointer-events-none">
-                  <Loader2 className="w-4 h-4 animate-spin text-[#D4AF37]" aria-hidden="true" />
+              {!showPipOffPlaceholder && !pipReady && (
+                <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-1.5 bg-white/10 rounded-xl animate-pulse pointer-events-none">
+                  <Camera className="w-5 h-5 text-[#F5D97E]/80" aria-hidden="true" />
                 </div>
               )}
 

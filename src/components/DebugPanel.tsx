@@ -59,7 +59,14 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({onBack}) => {
   const [result, setResult] = useState<DebugTtsResponse | null>(null);
 
   // Banco de Vozes (Admin Dev Tooling)
-  const [adminToken, setAdminToken] = useState('');
+  const [adminToken, setAdminToken] = useState<string>(() => {
+    if (typeof window === 'undefined') return '';
+    try {
+      return sessionStorage.getItem('santa_admin_token') || '';
+    } catch {
+      return '';
+    }
+  });
   const [overwriteBank, setOverwriteBank] = useState(false);
   const [bankFiles, setBankFiles] = useState<AudioBankFileItem[]>([]);
   const [isLoadingBankList, setIsLoadingBankList] = useState(false);
@@ -553,7 +560,19 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({onBack}) => {
                   id="debug-admin-token"
                   type="password"
                   value={adminToken}
-                  onChange={(e) => setAdminToken(e.target.value)}
+                  onChange={(e) => {
+                    const nextVal = e.target.value;
+                    setAdminToken(nextVal);
+                    try {
+                      if (nextVal.trim()) {
+                        sessionStorage.setItem('santa_admin_token', nextVal.trim());
+                      } else {
+                        sessionStorage.removeItem('santa_admin_token');
+                      }
+                    } catch {
+                      // Ignore storage restrictions
+                    }
+                  }}
                   placeholder="Cole o ADMIN_TOKEN configurado no servidor"
                   autoComplete="off"
                   className="w-full min-h-[48px] pl-10 pr-4 rounded-xl bg-[#0B0C10] border border-white/15 text-sm text-white placeholder:text-[#6B7280] focus:outline-none focus:border-[#D4AF37]"

@@ -60,6 +60,7 @@ const DEFAULT_ASAAS_LINKS: AsaasPlanLinks = {
 };
 
 const PENDING_CHECKOUT_KEY = 'santa_pending_checkout';
+const ADMIN_TOKEN_SESSION_KEY = 'santa_admin_token';
 const REF_STORAGE_KEY = 'santa_ref_id';
 const SAVED_MAGICS_KEY = 'santa_my_magics';
 
@@ -369,6 +370,8 @@ export default function App() {
 
     const pagamentoOk = params?.get('pagamento') === 'ok' && Boolean(params?.get('id'));
     const pagamentoId = params?.get('id')?.trim() || '';
+    const debugQueryFlag = params?.get('debug') === 'true';
+    const debugQueryAdminToken = params?.get('adminToken')?.trim() || '';
 
     const audioFromUrl = decodeAudioMagicFromUrl();
     if (audioFromUrl) {
@@ -377,6 +380,8 @@ export default function App() {
         isAudioLink: true,
         isVideoLink: false,
         isDebugUrl: false,
+        debugQueryFlag: false,
+        debugQueryAdminToken: '',
         initialAudioText: audioFromUrl.audioText,
         linkToken: audioFromUrl.token,
         referrerId: storedRef || null,
@@ -392,6 +397,8 @@ export default function App() {
         isAudioLink: false,
         isVideoLink: true,
         isDebugUrl: fromUrl.isDebugUrl,
+        debugQueryFlag: false,
+        debugQueryAdminToken: '',
         initialAudioText: undefined as string | undefined,
         linkToken: fromUrl.token,
         referrerId: storedRef || null,
@@ -427,6 +434,8 @@ export default function App() {
       isAudioLink: false,
       isVideoLink: false,
       isDebugUrl: false,
+      debugQueryFlag,
+      debugQueryAdminToken,
       initialAudioText: undefined as string | undefined,
       linkToken: null as string | null,
       referrerId: storedRef || null,
@@ -899,6 +908,63 @@ export default function App() {
         } finally {
           setIsConfirmingPayment(false);
         }
+        return;
+      }
+
+      // 3) Direct debug unlock URL: /?debug=true&adminToken=...
+      if (initialState.debugQueryFlag && initialState.debugQueryAdminToken) {
+        setIsConfirmingPayment(true);
+        try {
+          try {
+            sessionStorage.setItem(ADMIN_TOKEN_SESSION_KEY, initialState.debugQueryAdminToken);
+          } catch {
+            // Ignore storage errors
+          }
+          const queryUrl = `/api/debug/unlock-all-plans?debug=true&adminToken=${encodeURIComponent(
+            initialState.debugQueryAdminToken
+          )}`;
+          const res = await fetch(queryUrl, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'x-admin-token': initialState.debugQueryAdminToken,
+            },
+          });
+          const data = (await res.json()) as {
+            ok?: boolean;
+            token?: string;
+            planId?: PlanId;
+            childName?: string;
+            error?: string;
+          };
+          if (!res.ok || !data.token) {
+            throw new Error(data.error || 'Token Admin inválido para Modo Debug.');
+          }
+
+          setEntitlementToken(data.token);
+          entitlementTokenRef.current = data.token;
+          setPaidPlanId(data.planId || 'familia');
+          setDebugModeActive(true);
+          setConfig((prev) => ({
+            ...prev,
+            childName: prev.childName.trim() ? prev.childName : data.childName || 'Teste Debug',
+          }));
+          screenRef.current = 'parent';
+          setScreen('parent');
+          try {
+            window.history.replaceState({}, '', window.location.pathname);
+          } catch {
+            // Ignore history restrictions
+          }
+        } catch (err) {
+          setDebugError(
+            err instanceof Error ? err.message : 'Erro ao validar link de Modo Debug.'
+          );
+          screenRef.current = 'parent';
+          setScreen('parent');
+        } finally {
+          setIsConfirmingPayment(false);
+        }
       }
     };
 
@@ -906,51 +972,86 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const handleToggleDebugMode = useCallback(async (enable: boolean) => {
-    setDebugError(null);
-    if (!enable) {
-      setDebugModeActive(false);
-      setEntitlementToken(null);
-      entitlementTokenRef.current = null;
-      setPaidPlanId(null);
-      return;
-    }
-
-    setIsTogglingDebug(true);
-    try {
-      const res = await fetch('/api/debug/unlock-all-plans', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-      });
-      const data = (await res.json()) as {
-        ok?: boolean;
-        token?: string;
-        planId?: PlanId;
-        childName?: string;
-        error?: string;
-      };
-      if (!res.ok || !data.token) {
-        throw new Error(data.error || 'Não foi possível ativar o Modo Debug Global.');
+  const handleToggleDebugMode = useCallback(
+    async (
+      enable: boolean,
+      adminTokenOverride?: string
+    ): Promise<{ok: boolean; needsToken?: boolean}> => {
+      setDebugError(null);
+      if (!enable) {
+        setDebugModeActive(false);
+        setEntitlementToken(null);
+        entitlementTokenRef.current = null;
+        setPaidPlanId(null);
+        return {ok: true};
       }
 
-      setEntitlementToken(data.token);
-      entitlementTokenRef.current = data.token;
-      setPaidPlanId(data.planId || 'familia');
-      setDebugModeActive(true);
-      setPaymentConfirmError(null);
-      setCheckoutGate(null);
-      setConfig((prev) => ({
-        ...prev,
-        childName: prev.childName.trim() ? prev.childName : data.childName || 'Teste Debug',
-      }));
-    } catch (err) {
-      setDebugError(
-        err instanceof Error ? err.message : 'Erro ao ativar Modo Debug Global.'
-      );
-    } finally {
-      setIsTogglingDebug(false);
-    }
-  }, []);
+      let resolvedAdminToken = (adminTokenOverride ?? '').trim();
+      if (!resolvedAdminToken && typeof window !== 'undefined') {
+        try {
+          resolvedAdminToken = (sessionStorage.getItem(ADMIN_TOKEN_SESSION_KEY) || '').trim();
+        } catch {
+          resolvedAdminToken = '';
+        }
+      }
+
+      setIsTogglingDebug(true);
+      try {
+        const headers: Record<string, string> = {'Content-Type': 'application/json'};
+        if (resolvedAdminToken) {
+          headers['x-admin-token'] = resolvedAdminToken;
+        }
+        const res = await fetch('/api/debug/unlock-all-plans', {
+          method: 'POST',
+          headers,
+        });
+        const data = (await res.json()) as {
+          ok?: boolean;
+          token?: string;
+          planId?: PlanId;
+          childName?: string;
+          requiresAdminToken?: boolean;
+          error?: string;
+        };
+        if (res.status === 401 || data.requiresAdminToken) {
+          const msg = data.error || 'Token de administrador ausente ou inválido.';
+          setDebugError(msg);
+          return {ok: false, needsToken: true};
+        }
+        if (!res.ok || !data.token) {
+          throw new Error(data.error || 'Não foi possível ativar o Modo Debug Global.');
+        }
+
+        if (resolvedAdminToken) {
+          try {
+            sessionStorage.setItem(ADMIN_TOKEN_SESSION_KEY, resolvedAdminToken);
+          } catch {
+            // Ignore storage restrictions
+          }
+        }
+
+        setEntitlementToken(data.token);
+        entitlementTokenRef.current = data.token;
+        setPaidPlanId(data.planId || 'familia');
+        setDebugModeActive(true);
+        setPaymentConfirmError(null);
+        setCheckoutGate(null);
+        setConfig((prev) => ({
+          ...prev,
+          childName: prev.childName.trim() ? prev.childName : data.childName || 'Teste Debug',
+        }));
+        return {ok: true};
+      } catch (err) {
+        setDebugError(
+          err instanceof Error ? err.message : 'Erro ao ativar Modo Debug Global.'
+        );
+        return {ok: false};
+      } finally {
+        setIsTogglingDebug(false);
+      }
+    },
+    []
+  );
 
   const handleSubmitParentRegistration = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1186,7 +1287,7 @@ export default function App() {
     PLANS.find((p) => p.id === checkoutGate?.config.planId) || PLANS[3];
   const checkoutAsaasUrl = checkoutGate ? asaasLinks[checkoutGate.config.planId] : null;
 
-  const canUseDebugMode = import.meta.env.DEV || Boolean(debugStatus?.debugActive);
+  const canUseDebugMode = true;
 
   return (
     <div className="min-h-[100dvh] bg-[#0B0C10] text-[#F7F4EC] relative overflow-x-hidden">
@@ -1832,13 +1933,12 @@ export default function App() {
           onOpenMyMagics={() => setScreen('my-magics')}
           onMagicLinkCreated={appendSavedMagic}
           canUseDebugMode={canUseDebugMode}
+          requiresAdminToken={debugStatus?.requiresAdminToken ?? true}
           debugModeActive={debugModeActive}
           isTogglingDebug={isTogglingDebug}
           debugMissingEnvVars={debugStatus?.missingEnvVars || []}
           debugError={debugError}
-          onToggleDebugMode={(enable) => {
-            void handleToggleDebugMode(enable);
-          }}
+          onToggleDebugMode={handleToggleDebugMode}
         />
       )}
 

@@ -2,8 +2,11 @@ import React, {useCallback, useEffect, useRef, useState} from 'react';
 import {
   AlertTriangle,
   ArrowLeft,
+  ChevronDown,
+  ChevronUp,
   CreditCard,
   Download,
+  Eye,
   FileAudio,
   Gift,
   KeyRound,
@@ -12,9 +15,10 @@ import {
   LogOut,
   RefreshCw,
   ShieldCheck,
+  ShoppingBag,
   Users,
 } from 'lucide-react';
-import {AdminOverviewResponse} from '../types';
+import {AdminOverviewResponse, AsaasBuyerDetail, AsaasBuyerSummary} from '../types';
 
 interface AdminScreenProps {
   initialToken?: string | null;
@@ -45,54 +49,139 @@ export const AdminScreen: React.FC<AdminScreenProps> = ({initialToken, onBackHom
     initialToken?.trim() ? initialToken.trim() : null
   );
   const [overview, setOverview] = useState<AdminOverviewResponse | null>(null);
+  const [activeTab, setActiveTab] = useState<'overview' | 'buyers'>('overview');
+  const [buyers, setBuyers] = useState<AsaasBuyerSummary[]>([]);
+  const [buyersSource, setBuyersSource] = useState<'firestore' | 'memory' | null>(null);
+  const [buyersLoading, setBuyersLoading] = useState(false);
+  const [buyersError, setBuyersError] = useState<string | null>(null);
+  const [expandedPaymentId, setExpandedPaymentId] = useState<string | null>(null);
+  const [buyerDetailsById, setBuyerDetailsById] = useState<Record<string, AsaasBuyerDetail>>({});
+  const [loadingDetailId, setLoadingDetailId] = useState<string | null>(null);
+  const [detailErrorsById, setDetailErrorsById] = useState<Record<string, string>>({});
   const [isLoading, setIsLoading] = useState(Boolean(initialToken?.trim()));
   const [error, setError] = useState<string | null>(null);
   const scrubbedUrlRef = useRef(false);
 
-  const loadOverview = useCallback(async (tokenToUse: string) => {
+  const loadBuyers = useCallback(async (tokenToUse: string) => {
     const cleanToken = tokenToUse.trim();
-    if (!cleanToken) {
-      setActiveToken(null);
-      setOverview(null);
-      setError('Informe o token de administrador.');
-      return;
-    }
-
-    setIsLoading(true);
-    setError(null);
+    if (!cleanToken) return;
+    setBuyersLoading(true);
+    setBuyersError(null);
     try {
-      const res = await fetch('/api/admin/overview', {
+      const res = await fetch('/api/admin/buyers', {
         method: 'GET',
         headers: {
           'x-admin-token': cleanToken,
         },
       });
-      const data = (await res.json()) as AdminOverviewResponse & {error?: string};
-      if (res.status === 401) {
-        setActiveToken(null);
-        setOverview(null);
-        setError(data.error || 'Token de administrador inválido ou ausente.');
-        return;
-      }
+      const data = (await res.json()) as {
+        source?: 'firestore' | 'memory';
+        buyers?: AsaasBuyerSummary[];
+        error?: string;
+      };
       if (!res.ok) {
         throw new Error(data.error || `Erro HTTP ${res.status}`);
       }
-      setActiveToken(cleanToken);
-      setOverview(data);
-      if (!scrubbedUrlRef.current && typeof window !== 'undefined' && window.location.search) {
-        scrubbedUrlRef.current = true;
-        try {
-          window.history.replaceState({}, '', window.location.pathname);
-        } catch {
-          // Ignore history restriction
-        }
-      }
+      setBuyers(Array.isArray(data.buyers) ? data.buyers : []);
+      setBuyersSource(data.source || 'memory');
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Não foi possível carregar o painel admin.');
+      setBuyersError(
+        err instanceof Error ? err.message : 'Não foi possível carregar a lista de compradores.'
+      );
     } finally {
-      setIsLoading(false);
+      setBuyersLoading(false);
     }
   }, []);
+
+  const loadOverview = useCallback(
+    async (tokenToUse: string) => {
+      const cleanToken = tokenToUse.trim();
+      if (!cleanToken) {
+        setActiveToken(null);
+        setOverview(null);
+        setError('Informe o token de administrador.');
+        return;
+      }
+
+      setIsLoading(true);
+      setError(null);
+      try {
+        const res = await fetch('/api/admin/overview', {
+          method: 'GET',
+          headers: {
+            'x-admin-token': cleanToken,
+          },
+        });
+        const data = (await res.json()) as AdminOverviewResponse & {error?: string};
+        if (res.status === 401) {
+          setActiveToken(null);
+          setOverview(null);
+          setBuyers([]);
+          setError(data.error || 'Token de administrador inválido ou ausente.');
+          return;
+        }
+        if (!res.ok) {
+          throw new Error(data.error || `Erro HTTP ${res.status}`);
+        }
+        setActiveToken(cleanToken);
+        setOverview(data);
+        void loadBuyers(cleanToken);
+        if (!scrubbedUrlRef.current && typeof window !== 'undefined' && window.location.search) {
+          scrubbedUrlRef.current = true;
+          try {
+            window.history.replaceState({}, '', window.location.pathname);
+          } catch {
+            // Ignore history restriction
+          }
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Não foi possível carregar o painel admin.');
+      } finally {
+        setIsLoading(false);
+      }
+    },
+    [loadBuyers]
+  );
+
+  const handleToggleBuyerDetails = async (paymentId: string) => {
+    if (expandedPaymentId === paymentId) {
+      setExpandedPaymentId(null);
+      return;
+    }
+    setExpandedPaymentId(paymentId);
+    if (buyerDetailsById[paymentId] || !activeToken) {
+      return;
+    }
+    setLoadingDetailId(paymentId);
+    setDetailErrorsById((prev) => {
+      const next = {...prev};
+      delete next[paymentId];
+      return next;
+    });
+    try {
+      const res = await fetch(`/api/admin/buyers/${encodeURIComponent(paymentId)}`, {
+        method: 'GET',
+        headers: {
+          'x-admin-token': activeToken,
+        },
+      });
+      const data = (await res.json()) as AsaasBuyerDetail & {error?: string};
+      if (!res.ok) {
+        throw new Error(data.error || `Erro HTTP ${res.status}`);
+      }
+      setBuyerDetailsById((prev) => ({
+        ...prev,
+        [paymentId]: data,
+      }));
+    } catch (err) {
+      setDetailErrorsById((prev) => ({
+        ...prev,
+        [paymentId]: err instanceof Error ? err.message : 'Erro ao carregar detalhes do comprador.',
+      }));
+    } finally {
+      setLoadingDetailId(null);
+    }
+  };
 
   useEffect(() => {
     if (initialToken?.trim()) {
@@ -108,6 +197,9 @@ export const AdminScreen: React.FC<AdminScreenProps> = ({initialToken, onBackHom
   const handleLogout = () => {
     setActiveToken(null);
     setOverview(null);
+    setBuyers([]);
+    setBuyerDetailsById({});
+    setExpandedPaymentId(null);
     setTokenInput('');
     setError(null);
   };
@@ -180,6 +272,23 @@ export const AdminScreen: React.FC<AdminScreenProps> = ({initialToken, onBackHom
           '',
           '',
           '',
+        ]
+          .map(sanitizeCsvCell)
+          .join(',')
+      );
+    }
+
+    for (const buyerRow of buyers) {
+      lines.push(
+        [
+          'COMPRADOR',
+          buyerRow.paymentId,
+          buyerRow.buyer.name,
+          buyerRow.buyer.phone,
+          buyerRow.buyer.email,
+          buyerRow.planId,
+          buyerRow.status,
+          buyerRow.timestamps?.paidAt || buyerRow.timestamps?.createdAt || '',
         ]
           .map(sanitizeCsvCell)
           .join(',')
@@ -347,6 +456,49 @@ export const AdminScreen: React.FC<AdminScreenProps> = ({initialToken, onBackHom
           </div>
         )}
 
+        {/* Tab Switcher */}
+        <nav aria-label="Seções do painel administrativo" className="flex flex-wrap items-center gap-2 border-b border-white/10 pb-3">
+          <button
+            type="button"
+            onClick={() => setActiveTab('overview')}
+            className={`min-h-[40px] px-4 rounded-xl text-xs sm:text-sm font-semibold flex items-center gap-2 transition-colors cursor-pointer ${
+              activeTab === 'overview'
+                ? 'bg-[#D4AF37] text-[#0B0C10]'
+                : 'border border-white/15 bg-[#13151C] text-[#D1D5DB] hover:bg-white/5'
+            }`}
+          >
+            <CreditCard className="w-4 h-4" aria-hidden="true" />
+            <span>Visão Geral</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('buyers');
+              if (activeToken) {
+                void loadBuyers(activeToken);
+              }
+            }}
+            className={`min-h-[40px] px-4 rounded-xl text-xs sm:text-sm font-semibold flex items-center gap-2 transition-colors cursor-pointer ${
+              activeTab === 'buyers'
+                ? 'bg-[#D4AF37] text-[#0B0C10]'
+                : 'border border-white/15 bg-[#13151C] text-[#D1D5DB] hover:bg-white/5'
+            }`}
+          >
+            <ShoppingBag className="w-4 h-4" aria-hidden="true" />
+            <span>Compradores</span>
+            <span
+              className={`px-1.5 py-0.5 rounded-md text-[11px] tabular-nums ${
+                activeTab === 'buyers'
+                  ? 'bg-[#0B0C10]/20 text-[#0B0C10]'
+                  : 'bg-white/10 text-[#F5D97E]'
+              }`}
+            >
+              {buyers.length}
+            </span>
+          </button>
+        </nav>
+
         {/* Summary Counters */}
         <section aria-label="Resumo operacional" className="grid grid-cols-2 lg:grid-cols-4 gap-4">
           <div className="rounded-2xl border border-[#D4AF37]/30 bg-[#13151C] p-5 space-y-1">
@@ -379,6 +531,249 @@ export const AdminScreen: React.FC<AdminScreenProps> = ({initialToken, onBackHom
           </div>
         </section>
 
+        {activeTab === 'buyers' ? (
+          <section className="rounded-3xl border border-white/10 bg-[#13151C]/95 p-5 sm:p-6 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="space-y-0.5">
+                <h2
+                  className="text-lg font-semibold text-[#F5D97E]"
+                  style={{fontFamily: 'var(--font-display)'}}
+                >
+                  Compradores Asaas ({buyers.length})
+                </h2>
+                <p className="text-xs text-[#A8A396]">
+                  Fonte:{' '}
+                  {buyersSource === 'firestore'
+                    ? 'Firestore (asaas_buyers)'
+                    : 'Cache em memória (configure FIREBASE_SERVICE_ACCOUNT_JSON para persistência permanente)'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => activeToken && void loadBuyers(activeToken)}
+                disabled={buyersLoading}
+                className="min-h-[36px] px-3 rounded-xl border border-white/15 bg-[#0B0C10] text-xs font-medium text-[#E5E0D4] flex items-center gap-1.5 hover:bg-white/5 cursor-pointer disabled:opacity-60"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${buyersLoading ? 'animate-spin' : ''}`} aria-hidden="true" />
+                <span>Atualizar compradores</span>
+              </button>
+            </div>
+
+            {buyersError && (
+              <div
+                role="alert"
+                className="rounded-2xl border border-red-400/50 bg-red-950/70 px-4 py-3 text-xs text-red-100 flex items-start gap-2"
+              >
+                <AlertTriangle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" aria-hidden="true" />
+                <span>{buyersError}</span>
+              </div>
+            )}
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs sm:text-sm">
+                <thead>
+                  <tr className="border-b border-white/10 text-[#A8A396] text-xs uppercase">
+                    <th className="py-2.5 pr-4 font-semibold">Nome</th>
+                    <th className="py-2.5 pr-4 font-semibold">Telefone</th>
+                    <th className="py-2.5 pr-4 font-semibold">Email</th>
+                    <th className="py-2.5 pr-4 font-semibold">Plano</th>
+                    <th className="py-2.5 pr-4 font-semibold">Status</th>
+                    <th className="py-2.5 pr-4 font-semibold">Data</th>
+                    <th className="py-2.5 font-semibold text-right">Detalhes</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-white/5">
+                  {buyersLoading && buyers.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-6 text-center text-xs text-[#A8A396]">
+                        <Loader2 className="w-4 h-4 animate-spin inline mr-2" aria-hidden="true" />
+                        Carregando compradores...
+                      </td>
+                    </tr>
+                  ) : buyers.length === 0 ? (
+                    <tr>
+                      <td colSpan={7} className="py-6 text-center text-xs text-[#8D887C]">
+                        Nenhum comprador registrado via Asaas até o momento.
+                      </td>
+                    </tr>
+                  ) : (
+                    buyers.map((row) => {
+                      const isExpanded = expandedPaymentId === row.paymentId;
+                      const detail = buyerDetailsById[row.paymentId];
+                      const isDetailLoading = loadingDetailId === row.paymentId;
+                      const detailErr = detailErrorsById[row.paymentId];
+
+                      return (
+                        <React.Fragment key={row.paymentId}>
+                          <tr className="hover:bg-white/[0.02]">
+                            <td className="py-2.5 pr-4 text-[#F7F4EC] font-medium">
+                              {row.buyer?.name || '—'}
+                            </td>
+                            <td className="py-2.5 pr-4 text-[#C7C2B6]">
+                              {row.buyer?.phone || '—'}
+                            </td>
+                            <td className="py-2.5 pr-4 text-[#C7C2B6]">
+                              {row.buyer?.email || '—'}
+                            </td>
+                            <td className="py-2.5 pr-4 uppercase text-xs font-semibold text-[#F5D97E]">
+                              {row.planId}
+                            </td>
+                            <td className="py-2.5 pr-4 text-xs text-emerald-300 font-medium">
+                              {row.status}
+                            </td>
+                            <td className="py-2.5 pr-4 text-xs text-[#9CA3AF]">
+                              {formatDateBr(row.timestamps?.paidAt || row.timestamps?.createdAt)}
+                            </td>
+                            <td className="py-2.5 text-right">
+                              <button
+                                type="button"
+                                onClick={() => void handleToggleBuyerDetails(row.paymentId)}
+                                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#D4AF37]/40 bg-[#0B0C10] text-xs font-medium text-[#F5D97E] hover:bg-white/5 cursor-pointer"
+                              >
+                                <Eye className="w-3.5 h-3.5" aria-hidden="true" />
+                                <span>{isExpanded ? 'Ocultar' : 'Ver detalhes'}</span>
+                                {isExpanded ? (
+                                  <ChevronUp className="w-3.5 h-3.5" aria-hidden="true" />
+                                ) : (
+                                  <ChevronDown className="w-3.5 h-3.5" aria-hidden="true" />
+                                )}
+                              </button>
+                            </td>
+                          </tr>
+
+                          {isExpanded && (
+                            <tr className="bg-[#0B0C10]/80">
+                              <td colSpan={7} className="p-4 border-t border-white/10">
+                                {isDetailLoading ? (
+                                  <div className="flex items-center gap-2 text-xs text-[#A8A396]">
+                                    <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+                                    <span>Buscando detalhes do pagamento {row.paymentId}...</span>
+                                  </div>
+                                ) : detailErr ? (
+                                  <p className="text-xs text-red-300">{detailErr}</p>
+                                ) : detail ? (
+                                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                                    <div className="rounded-2xl border border-white/10 bg-[#13151C] p-3.5 space-y-1.5">
+                                      <h3 className="font-semibold text-[#F5D97E]">Pagamento Asaas</h3>
+                                      <p className="text-[#C7C2B6]">
+                                        <span className="text-[#8D887C]">ID:</span>{' '}
+                                        <span className="font-mono text-[#F7F4EC]">{detail.paymentId}</span>
+                                      </p>
+                                      <p className="text-[#C7C2B6]">
+                                        <span className="text-[#8D887C]">Valor:</span>{' '}
+                                        {formatCurrencyBrl(detail.amount)}
+                                      </p>
+                                      <p className="text-[#C7C2B6]">
+                                        <span className="text-[#8D887C]">Método:</span>{' '}
+                                        {detail.billingType || '—'}
+                                      </p>
+                                      {detail.buyer?.cpfCnpj && (
+                                        <p className="text-[#C7C2B6]">
+                                          <span className="text-[#8D887C]">CPF/CNPJ:</span>{' '}
+                                          {detail.buyer.cpfCnpj}
+                                        </p>
+                                      )}
+                                      <p className="text-[#C7C2B6]">
+                                        <span className="text-[#8D887C]">Pago em:</span>{' '}
+                                        {formatDateBr(detail.timestamps?.paidAt || detail.timestamps?.createdAt)}
+                                      </p>
+                                    </div>
+
+                                    <div className="rounded-2xl border border-white/10 bg-[#13151C] p-3.5 space-y-1.5">
+                                      <h3 className="font-semibold text-[#F5D97E]">Submissão da Criança</h3>
+                                      {detail.childSubmission ? (
+                                        <>
+                                          <p className="text-[#C7C2B6]">
+                                            <span className="text-[#8D887C]">Criança:</span>{' '}
+                                            <span className="text-[#F7F4EC] font-medium">
+                                              {detail.childSubmission.childName || '—'}
+                                            </span>
+                                            {detail.childSubmission.childAge
+                                              ? ` (${detail.childSubmission.childAge} anos)`
+                                              : ''}
+                                          </p>
+                                          {detail.childSubmission.praise && (
+                                            <p className="text-[#C7C2B6]">
+                                              <span className="text-[#8D887C]">Elogio:</span>{' '}
+                                              {detail.childSubmission.praise}
+                                            </p>
+                                          )}
+                                          {detail.childSubmission.advice && (
+                                            <p className="text-[#C7C2B6]">
+                                              <span className="text-[#8D887C]">Conselho:</span>{' '}
+                                              {detail.childSubmission.advice}
+                                            </p>
+                                          )}
+                                          {detail.childSubmission.farewellType && (
+                                            <p className="text-[#C7C2B6]">
+                                              <span className="text-[#8D887C]">Despedida:</span>{' '}
+                                              {detail.childSubmission.farewellType}
+                                            </p>
+                                          )}
+                                          <p className="text-[#C7C2B6]">
+                                            <span className="text-[#8D887C]">Enviado em:</span>{' '}
+                                            {formatDateBr(detail.childSubmission.submittedAt)}
+                                          </p>
+                                        </>
+                                      ) : (
+                                        <p className="text-[#8D887C]">
+                                          Dados da criança ainda não enviados / chamada não iniciada.
+                                        </p>
+                                      )}
+                                    </div>
+
+                                    <div className="rounded-2xl border border-white/10 bg-[#13151C] p-3.5 space-y-1.5">
+                                      <h3 className="font-semibold text-[#F5D97E]">Direito de Chamada (`callGrant`)</h3>
+                                      {detail.callGrant ? (
+                                        <>
+                                          <p className="text-[#C7C2B6]">
+                                            <span className="text-[#8D887C]">Utilizado:</span>{' '}
+                                            <span
+                                              className={
+                                                detail.callGrant.used
+                                                  ? 'text-emerald-300 font-semibold'
+                                                  : 'text-amber-300 font-semibold'
+                                              }
+                                            >
+                                              {detail.callGrant.used ? 'Sim' : 'Não'}
+                                            </span>
+                                          </p>
+                                          {detail.callGrant.usedAt && (
+                                            <p className="text-[#C7C2B6]">
+                                              <span className="text-[#8D887C]">Usado em:</span>{' '}
+                                              {formatDateBr(detail.callGrant.usedAt)}
+                                            </p>
+                                          )}
+                                          <p className="text-[#C7C2B6]">
+                                            <span className="text-[#8D887C]">Expira em:</span>{' '}
+                                            {formatDateBr(detail.callGrant.expiresAt)}
+                                          </p>
+                                          <p className="text-[#C7C2B6] break-all">
+                                            <span className="text-[#8D887C]">Token hash:</span>{' '}
+                                            <span className="font-mono text-[11px]">
+                                              {detail.callGrant.tokenHash.slice(0, 18)}…
+                                            </span>
+                                          </p>
+                                        </>
+                                      ) : (
+                                        <p className="text-[#8D887C]">Sem registro de concessão.</p>
+                                      )}
+                                    </div>
+                                  </div>
+                                ) : null}
+                              </td>
+                            </tr>
+                          )}
+                        </React.Fragment>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        ) : (
+          <>
         {/* Table 1: Pagamentos */}
         <section className="rounded-3xl border border-white/10 bg-[#13151C]/95 p-5 sm:p-6 space-y-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -597,6 +992,8 @@ export const AdminScreen: React.FC<AdminScreenProps> = ({initialToken, onBackHom
             </table>
           </div>
         </section>
+          </>
+        )}
       </main>
     </div>
   );

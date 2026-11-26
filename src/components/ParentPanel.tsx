@@ -6,6 +6,7 @@ import {
   CreditCard,
   ExternalLink,
   FolderHeart,
+  KeyRound,
   Loader2,
   Lock,
   Mail,
@@ -13,6 +14,7 @@ import {
   Send,
   Sparkles,
   Volume2,
+  X,
 } from 'lucide-react';
 import {
   AsaasPlanLinks,
@@ -39,13 +41,18 @@ interface ParentPanelProps {
   onOpenMyMagics?: () => void;
   onMagicLinkCreated?: (item: SavedMagicItem) => void;
   canUseDebugMode?: boolean;
+  requiresAdminToken?: boolean;
   debugModeActive?: boolean;
   isTogglingDebug?: boolean;
   debugMissingEnvVars?: string[];
   debugError?: string | null;
-  onToggleDebugMode?: (enable: boolean) => void;
+  onToggleDebugMode?: (
+    enable: boolean,
+    adminTokenOverride?: string
+  ) => Promise<{ok: boolean; needsToken?: boolean}> | void;
 }
 
+const ADMIN_TOKEN_SESSION_KEY = 'santa_admin_token';
 const PENDING_CHECKOUT_STORAGE_KEY = 'santa_pending_checkout';
 
 function isPlanAuthorized(
@@ -90,7 +97,8 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
   referrerId,
   onOpenMyMagics,
   onMagicLinkCreated,
-  canUseDebugMode = false,
+  canUseDebugMode: _canUseDebugMode = true,
+  requiresAdminToken = true,
   debugModeActive = false,
   isTogglingDebug = false,
   debugMissingEnvVars = [],
@@ -104,6 +112,9 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
   const [formError, setFormError] = useState<string | null>(null);
   const [checkoutNotice, setCheckoutNotice] = useState<string | null>(null);
   const [ctaCountdown, setCtaCountdown] = useState<number>(10);
+  const [showAdminTokenModal, setShowAdminTokenModal] = useState(false);
+  const [adminTokenInput, setAdminTokenInput] = useState('');
+  const [modalTokenError, setModalTokenError] = useState<string | null>(null);
 
   useEffect(() => {
     setCtaCountdown(10);
@@ -144,7 +155,7 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
     }
   };
 
-  const handleSelectPlanCheckout = (planId: PlanId, e?: React.MouseEvent) => {
+  const handleSelectPlanCheckout = async (planId: PlanId, e?: React.MouseEvent) => {
     if (e) {
       e.stopPropagation();
     }
@@ -153,12 +164,35 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
     persistPendingCheckout(planId);
 
     const url = asaasLinks[planId];
-    if (!isSafeHttpUrl(url)) {
-      if (e) {
-        e.preventDefault();
+    if (isSafeHttpUrl(url)) {
+      return;
+    }
+
+    if (e) {
+      e.preventDefault();
+    }
+
+    try {
+      const res = await fetch('/api/pay/create-link', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          planId,
+          ...(referrerId ? {ref: referrerId} : {}),
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {url?: string; error?: string};
+      if (res.ok && isSafeHttpUrl(data.url)) {
+        window.location.assign(data.url);
+        return;
       }
       setCheckoutNotice(
-        `Link de checkout Asaas não configurado no servidor para este plano (ASAAS_LINK_${planId.toUpperCase()}).`
+        data.error ||
+          `Link de checkout Asaas não configurado no servidor para este plano (ASAAS_API_KEY ou ASAAS_LINK_${planId.toUpperCase()}).`
+      );
+    } catch {
+      setCheckoutNotice(
+        `Link de checkout Asaas não configurado no servidor para este plano (ASAAS_API_KEY ou ASAAS_LINK_${planId.toUpperCase()}).`
       );
     }
   };
@@ -253,6 +287,71 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
     onStartCountdown();
   };
 
+  const getSavedAdminToken = (): string => {
+    try {
+      return (sessionStorage.getItem(ADMIN_TOKEN_SESSION_KEY) || '').trim();
+    } catch {
+      return '';
+    }
+  };
+
+  const handleDebugSwitchClick = async () => {
+    if (!onToggleDebugMode) return;
+    if (debugModeActive) {
+      await onToggleDebugMode(false);
+      return;
+    }
+
+    const savedToken = getSavedAdminToken();
+    if (!savedToken) {
+      setAdminTokenInput('');
+      setModalTokenError(null);
+      setShowAdminTokenModal(true);
+      return;
+    }
+
+    const result = await onToggleDebugMode(true, savedToken);
+    if (result && !result.ok && result.needsToken) {
+      setAdminTokenInput(savedToken);
+      setModalTokenError('Token Admin inválido ou recusado pelo servidor.');
+      setShowAdminTokenModal(true);
+    }
+  };
+
+  const handleSubmitAdminTokenModal = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!onToggleDebugMode) return;
+    const cleanToken = adminTokenInput.trim();
+    if (!cleanToken) {
+      setModalTokenError('Informe o Token Admin configurado no servidor.');
+      return;
+    }
+    setModalTokenError(null);
+    try {
+      sessionStorage.setItem(ADMIN_TOKEN_SESSION_KEY, cleanToken);
+    } catch {
+      // Ignore storage errors
+    }
+
+    const result = await onToggleDebugMode(true, cleanToken);
+    if (!result || result.ok) {
+      setShowAdminTokenModal(false);
+    } else {
+      setModalTokenError('Token Admin inválido ou não autorizado pelo servidor.');
+    }
+  };
+
+  const handleBypassWithoutTokenInDev = async () => {
+    if (!onToggleDebugMode) return;
+    setModalTokenError(null);
+    const result = await onToggleDebugMode(true, '');
+    if (!result || result.ok) {
+      setShowAdminTokenModal(false);
+    } else {
+      setModalTokenError('ADMIN_TOKEN exigido pelo servidor neste ambiente.');
+    }
+  };
+
   return (
     <div className="relative z-10 min-h-[100dvh] pb-28">
       {/* Header */}
@@ -338,15 +437,14 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
 
         {/* Section 1: 5 Planos com Checkout Asaas */}
         <section aria-labelledby="planos-heading" className="space-y-4">
-          {canUseDebugMode && onToggleDebugMode && (
+          {onToggleDebugMode && (
             <div className="rounded-2xl border border-white/15 bg-[#13151C] px-4 py-3.5 flex flex-wrap items-center justify-between gap-3">
               <div className="space-y-0.5">
                 <span className="text-sm font-semibold text-[#F7F4EC] flex items-center gap-2">
                   <span>🔓 Modo Teste (Sem Pagamento)</span>
                 </span>
                 <p className="text-xs text-[#A8A396]">
-                  Ative para gerar um token HMAC de teste e liberar todos os planos sem passar pelo
-                  Asaas.
+                  Ative usando o Token Admin para liberar todos os planos sem passar pelo Asaas.
                 </p>
               </div>
               <button
@@ -355,7 +453,9 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                 aria-checked={debugModeActive}
                 aria-label="Modo Teste (Sem Pagamento)"
                 disabled={isTogglingDebug}
-                onClick={() => onToggleDebugMode(!debugModeActive)}
+                onClick={() => {
+                  void handleDebugSwitchClick();
+                }}
                 className={`relative inline-flex h-8 w-14 shrink-0 items-center rounded-full border transition-colors cursor-pointer disabled:opacity-60 ${
                   debugModeActive
                     ? 'bg-red-600 border-red-400'
@@ -390,7 +490,7 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
             {PLANS.map((plan) => {
               const active = config.planId === plan.id;
               const isAnchoredBest = plan.id === 'familia';
-              const isAudioIsca = plan.id === 'audio';
+              const isAudioCard = plan.id === 'audio';
               const unlocked = isPlanAuthorized(
                 paidPlanId,
                 entitlementToken,
@@ -398,9 +498,10 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                 debugModeActive
               );
               const asaasUrl = asaasLinks[plan.id];
+              const origin = typeof window !== 'undefined' ? window.location.origin : '';
               const debugDirectUrl =
                 debugModeActive && entitlementToken
-                  ? `/?chamada=true&plano=${encodeURIComponent(plan.id)}&token=${encodeURIComponent(
+                  ? `${origin}/?chamada=true&plano=${encodeURIComponent(plan.id)}&token=${encodeURIComponent(
                       entitlementToken
                     )}`
                   : null;
@@ -423,7 +524,7 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                       ? active
                         ? 'border-[#D4AF37] bg-gradient-to-br from-[#231D0F] via-[#191B24] to-[#13151C] shadow-[0_0_0_2px_rgba(212,175,55,0.55)]'
                         : 'border-[#D4AF37]/60 bg-gradient-to-br from-[#1C1810] to-[#13151C] hover:border-[#D4AF37]'
-                      : isAudioIsca
+                      : isAudioCard
                         ? active
                           ? 'border-emerald-400 bg-gradient-to-br from-[#0F231C] via-[#191B24] to-[#13151C] shadow-[0_0_0_2px_rgba(52,211,153,0.45)] md:col-span-2'
                           : 'border-emerald-500/45 bg-gradient-to-br from-[#0E1B16] to-[#13151C] hover:border-emerald-400 md:col-span-2'
@@ -433,22 +534,24 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
                   }`}
                 >
                   <div className="space-y-2.5">
-                    {(isAnchoredBest || isAudioIsca) && plan.badge && (
+                    {(plan.badge || plan.topTag) && (
                       <div className="flex flex-wrap items-center justify-between gap-2 pb-1">
-                        <span
-                          className={`inline-flex items-center gap-1.5 text-[11px] font-bold tracking-wider uppercase px-2.5 py-1 rounded-md ${
-                            isAudioIsca
-                              ? 'text-[#0B0C10] bg-emerald-400'
-                              : 'text-[#0B0C10] bg-[#D4AF37]'
-                          }`}
-                        >
-                          <Sparkles className="w-3 h-3" aria-hidden="true" />
-                          {plan.badge}
-                        </span>
+                        {plan.badge && (
+                          <span
+                            className={`inline-flex items-center gap-1.5 text-[11px] font-bold tracking-wider uppercase px-2.5 py-1 rounded-md ${
+                              isAudioCard
+                                ? 'text-[#0B0C10] bg-emerald-400'
+                                : 'text-[#0B0C10] bg-[#D4AF37]'
+                            }`}
+                          >
+                            <Sparkles className="w-3 h-3" aria-hidden="true" />
+                            {plan.badge}
+                          </span>
+                        )}
                         {plan.topTag && (
                           <span
                             className={`text-[11px] font-semibold tracking-wider uppercase ${
-                              isAudioIsca ? 'text-emerald-300' : 'text-[#F5D97E]'
+                              isAudioCard ? 'text-emerald-300' : 'text-[#F5D97E]'
                             }`}
                           >
                             {plan.topTag}
@@ -830,6 +933,105 @@ export const ParentPanel: React.FC<ParentPanelProps> = ({
           </div>
         </div>
       </form>
+
+      {showAdminTokenModal && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="debug-admin-modal-title"
+        >
+          <form
+            onSubmit={handleSubmitAdminTokenModal}
+            className="w-full max-w-md rounded-3xl border border-[#D4AF37]/45 bg-[#13151C] p-6 sm:p-7 space-y-4 shadow-2xl"
+          >
+            <div className="flex items-start justify-between gap-3">
+              <div className="space-y-1">
+                <span className="inline-flex items-center gap-1.5 text-[11px] font-bold uppercase tracking-wider text-[#F5D97E]">
+                  <KeyRound className="w-3.5 h-3.5" aria-hidden="true" />
+                  Autenticação Administrativa
+                </span>
+                <h2
+                  id="debug-admin-modal-title"
+                  className="text-xl font-semibold text-[#F7F4EC]"
+                  style={{fontFamily: 'var(--font-display)'}}
+                >
+                  Informe o Token Admin
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAdminTokenModal(false)}
+                aria-label="Fechar modal de token admin"
+                className="p-2 rounded-lg text-[#9CA3AF] hover:text-white hover:bg-white/5 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <p className="text-xs sm:text-sm text-[#C7C2B6] leading-relaxed">
+              Digite o <strong className="text-white">ADMIN_TOKEN</strong> configurado no servidor
+              (o mesmo usado no Painel de Vozes / DebugPanel). Ele será mantido apenas nesta sessão
+              do navegador.
+            </p>
+
+            {(modalTokenError || debugError) && (
+              <div
+                role="alert"
+                className="rounded-xl border border-red-400/40 bg-red-950/60 px-3.5 py-2.5 text-xs text-red-100"
+              >
+                {modalTokenError || debugError}
+              </div>
+            )}
+
+            <div className="space-y-1.5">
+              <label htmlFor="parent-debug-admin-token" className="block text-xs font-medium text-[#E5E0D4]">
+                Token Admin (`x-admin-token`)
+              </label>
+              <input
+                id="parent-debug-admin-token"
+                type="password"
+                autoFocus
+                value={adminTokenInput}
+                onChange={(e) => setAdminTokenInput(e.target.value)}
+                placeholder="Cole o ADMIN_TOKEN"
+                autoComplete="off"
+                className="w-full min-h-[46px] px-3.5 rounded-xl bg-[#0B0C10] border border-white/15 text-sm text-white placeholder:text-[#6B7280] focus:outline-none focus:border-[#D4AF37]"
+              />
+            </div>
+
+            <div className="flex flex-col gap-2 pt-1">
+              <button
+                type="submit"
+                disabled={isTogglingDebug}
+                className="w-full min-h-[46px] px-4 rounded-xl bg-[#D4AF37] text-[#0B0C10] font-bold text-sm flex items-center justify-center gap-2 hover:bg-[#E5C454] cursor-pointer disabled:opacity-60"
+              >
+                {isTogglingDebug ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" aria-hidden="true" />
+                    <span>Validando...</span>
+                  </>
+                ) : (
+                  <span>Ativar Modo Teste</span>
+                )}
+              </button>
+
+              {!requiresAdminToken && (
+                <button
+                  type="button"
+                  disabled={isTogglingDebug}
+                  onClick={() => {
+                    void handleBypassWithoutTokenInDev();
+                  }}
+                  className="w-full min-h-[42px] px-4 rounded-xl border border-white/15 text-xs font-medium text-[#E5E7EB] hover:bg-white/5 cursor-pointer disabled:opacity-60"
+                >
+                  Ativar sem token (desenvolvimento)
+                </button>
+              )}
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 };

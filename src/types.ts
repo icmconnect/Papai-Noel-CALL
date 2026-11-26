@@ -68,7 +68,6 @@ export const PLANS: PlanOption[] = [
     priceLabel: 'R$ 4,90',
     summary: 'Mensagem de voz do Papai Noel por link, para guardar e ouvir quando quiser.',
     interactive: false,
-    badge: 'ISCA',
     topTag: 'SÓ ÁUDIO · SEM CHAMADA',
   },
 ];
@@ -221,8 +220,46 @@ export interface AdminOverviewResponse {
 
 export interface DebugStatusResponse {
   debugActive: boolean;
+  requiresAdminToken?: boolean;
   environment: string;
   missingEnvVars: string[];
   configured: Record<string, boolean>;
+}
+
+export interface AsaasBuyerSummary {
+  paymentId: string;
+  buyer: {
+    name: string;
+    phone: string;
+    email: string;
+    cpfCnpj?: string;
+  };
+  planId: string;
+  status: string;
+  amount: number;
+  timestamps: {
+    createdAt?: string;
+    paidAt?: string;
+    updatedAt?: string;
+  };
+}
+
+export interface AsaasBuyerDetail extends AsaasBuyerSummary {
+  billingType?: string;
+  childSubmission?: {
+    childName?: string;
+    childAge?: string;
+    praise?: string;
+    advice?: string;
+    farewellType?: string;
+    planId?: string;
+    submittedAt?: string;
+  } | null;
+  callGrant?: {
+    tokenHash: string;
+    used: boolean;
+    usedAt?: string;
+    expiresAt: string;
+  } | null;
 }
 

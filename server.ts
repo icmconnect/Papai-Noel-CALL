@@ -5,6 +5,8 @@ import fs from 'fs';
 import path from 'path';
 import {fileURLToPath} from 'url';
 import {GoogleGenAI, Type} from '@google/genai';
+import * as admin from 'firebase-admin';
+import {getFirestore, type Firestore} from 'firebase-admin/firestore';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -152,6 +154,362 @@ const creditedPaymentsByRef = new Map<string, Set<string>>();
 const pendingDigestEntries: DigestEntry[] = [];
 let digestTimerStarted = false;
 
+const PLAN_PRICES_BRL: Record<PlanId, {name: string; value: number}> = {
+  audio: {name: 'Áudio Mágico (Só Áudio)', value: 4.9},
+  '15s': {name: 'Chamada Rápida (15s)', value: 9.9},
+  '30s': {name: 'Chamada Especial (30s)', value: 19.9},
+  '60s': {name: 'Conversa Mágica (60s)', value: 29.9},
+  familia: {name: 'Passe Família Ilimitado', value: 39.9},
+};
+
+const ASAAS_BUYERS_COLLECTION = 'asaas_buyers';
+
+interface AsaasBuyerRecord {
+  paymentId: string;
+  planId: PlanId;
+  status: string;
+  amount: number;
+  billingType?: string;
+  customerId?: string;
+  buyer: {
+    name: string;
+    phone: string;
+    email: string;
+    cpfCnpj?: string;
+  };
+  ref?: string;
+  callGrant: {
+    tokenHash: string;
+    used: boolean;
+    usedAt?: string;
+    expiresAt: string;
+  };
+  childSubmission?: {
+    childName?: string;
+    childAge?: string;
+    praise?: string;
+    advice?: string;
+    farewellType?: string;
+    planId?: string;
+    submittedAt?: string;
+  } | null;
+  timestamps: {
+    createdAt: string;
+    paidAt?: string;
+    updatedAt: string;
+  };
+}
+
+const asaasBuyersFallbackMap = new Map<string, AsaasBuyerRecord>();
+let firestoreDbInstance: Firestore | null = null;
+let firestoreInitAttempted = false;
+
+function getFirestoreDb(): Firestore | null {
+  if (firestoreInitAttempted) {
+    return firestoreDbInstance;
+  }
+  firestoreInitAttempted = true;
+
+  try {
+    if (admin.getApps().length > 0) {
+      firestoreDbInstance = getFirestore();
+      return firestoreDbInstance;
+    }
+
+    const rawCred = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON || '').trim();
+    if (!rawCred) {
+      return null;
+    }
+
+    let parsedServiceAccount: admin.ServiceAccount;
+    if (rawCred.startsWith('{')) {
+      parsedServiceAccount = JSON.parse(rawCred) as admin.ServiceAccount;
+    } else {
+      const resolvedPath = path.resolve(process.cwd(), rawCred);
+      if (!fs.existsSync(resolvedPath)) {
+        console.warn('FIREBASE_SERVICE_ACCOUNT_JSON file not found; falling back to in-memory store.');
+        return null;
+      }
+      const fileContent = fs.readFileSync(resolvedPath, 'utf8');
+      parsedServiceAccount = JSON.parse(fileContent) as admin.ServiceAccount;
+    }
+
+    admin.initializeApp({
+      credential: admin.cert(parsedServiceAccount),
+    });
+    firestoreDbInstance = getFirestore();
+    return firestoreDbInstance;
+  } catch (err) {
+    console.warn(
+      'Failed to initialize firebase-admin Firestore; falling back to in-memory store:',
+      err instanceof Error ? err.message : String(err)
+    );
+    firestoreDbInstance = null;
+    return null;
+  }
+}
+
+function hashEntitlementToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex');
+}
+
+function isAsaasPaidStatus(raw?: string): boolean {
+  const normalized = (raw || '').trim().toUpperCase();
+  return (
+    normalized === 'PAYMENT_RECEIVED' ||
+    normalized === 'PAYMENT_CONFIRMED' ||
+    normalized === 'PAYMENT_RECEIVED_IN_CASH' ||
+    normalized === 'RECEIVED' ||
+    normalized === 'CONFIRMED' ||
+    normalized === 'RECEIVED_IN_CASH' ||
+    normalized === 'PAID'
+  );
+}
+
+function validatePaymentAmount(
+  planId: PlanId,
+  rawValue: unknown
+): {ok: boolean; expected: number; actual?: number} {
+  const expected = PLAN_PRICES_BRL[planId].value;
+  if (rawValue === undefined || rawValue === null || rawValue === '') {
+    return {ok: true, expected};
+  }
+  const numeric = typeof rawValue === 'number' ? rawValue : Number(rawValue);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return {ok: false, expected};
+  }
+  return {
+    ok: numeric + 0.01 >= expected,
+    expected,
+    actual: numeric,
+  };
+}
+
+async function fetchAsaasCustomer(
+  customerId: unknown,
+  apiKey: string
+): Promise<{name: string; phone: string; email: string; cpfCnpj?: string}> {
+  const id = typeof customerId === 'string' ? customerId.trim() : '';
+  if (!id || !apiKey || !/^[A-Za-z0-9_-]{3,80}$/.test(id)) {
+    return {name: '', phone: '', email: ''};
+  }
+
+  const abortCtrl = new AbortController();
+  const timeout = setTimeout(() => abortCtrl.abort(), 5000);
+  try {
+    const res = await fetch(`${getAsaasApiBaseUrl()}/customers/${encodeURIComponent(id)}`, {
+      method: 'GET',
+      headers: {
+        access_token: apiKey,
+        'User-Agent': 'aistudio-build',
+      },
+      signal: abortCtrl.signal,
+    });
+    if (!res.ok) {
+      return {name: '', phone: '', email: ''};
+    }
+    const customer = (await res.json()) as {
+      name?: unknown;
+      email?: unknown;
+      phone?: unknown;
+      mobilePhone?: unknown;
+      cpfCnpj?: unknown;
+    };
+    return {
+      name: typeof customer.name === 'string' ? customer.name.trim() : '',
+      phone:
+        typeof customer.mobilePhone === 'string' && customer.mobilePhone.trim()
+          ? customer.mobilePhone.trim()
+          : typeof customer.phone === 'string'
+            ? customer.phone.trim()
+            : '',
+      email: typeof customer.email === 'string' ? customer.email.trim().toLowerCase() : '',
+      ...(typeof customer.cpfCnpj === 'string' && customer.cpfCnpj.trim()
+        ? {cpfCnpj: customer.cpfCnpj.trim()}
+        : {}),
+    };
+  } catch {
+    return {name: '', phone: '', email: ''};
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function getAsaasBuyerDoc(paymentId: string): Promise<AsaasBuyerRecord | null> {
+  const db = getFirestoreDb();
+  if (db) {
+    try {
+      const snap = await db.collection(ASAAS_BUYERS_COLLECTION).doc(paymentId).get();
+      if (snap.exists) {
+        return snap.data() as AsaasBuyerRecord;
+      }
+    } catch (err) {
+      console.warn('Firestore read failed for asaas_buyers:', extractReadableError(err));
+    }
+  }
+  return asaasBuyersFallbackMap.get(paymentId) || null;
+}
+
+async function persistAsaasBuyerRecord(params: {
+  paymentId: string;
+  planId: PlanId;
+  status: string;
+  amount: number;
+  billingType?: string;
+  customerId?: string;
+  buyer: {name: string; phone: string; email: string; cpfCnpj?: string};
+  ref?: string;
+  token: string;
+  expiresAtMs: number;
+  paidAt?: string;
+}): Promise<{doc: AsaasBuyerRecord; alreadyTerminal: boolean}> {
+  const nowIso = new Date().toISOString();
+  const existing = await getAsaasBuyerDoc(params.paymentId);
+  const existingIsTerminal = Boolean(
+    existing && isAsaasPaidStatus(existing.status) && existing.callGrant?.tokenHash
+  );
+
+  if (existing && existingIsTerminal) {
+    const enrichedBuyer = {
+      name: existing.buyer?.name || params.buyer.name || '',
+      phone: existing.buyer?.phone || params.buyer.phone || '',
+      email: existing.buyer?.email || params.buyer.email || '',
+      ...(existing.buyer?.cpfCnpj || params.buyer.cpfCnpj
+        ? {cpfCnpj: existing.buyer?.cpfCnpj || params.buyer.cpfCnpj}
+        : {}),
+    };
+    const mergedDoc: AsaasBuyerRecord = {
+      ...existing,
+      buyer: enrichedBuyer,
+      billingType: existing.billingType || params.billingType,
+      customerId: existing.customerId || params.customerId,
+      timestamps: {
+        createdAt: existing.timestamps?.createdAt || nowIso,
+        paidAt: existing.timestamps?.paidAt || params.paidAt || nowIso,
+        updatedAt: nowIso,
+      },
+    };
+    asaasBuyersFallbackMap.set(params.paymentId, mergedDoc);
+    const db = getFirestoreDb();
+    if (db) {
+      try {
+        await db.collection(ASAAS_BUYERS_COLLECTION).doc(params.paymentId).set(mergedDoc, {merge: true});
+      } catch (err) {
+        console.warn('Firestore merge failed for terminal asaas_buyer:', extractReadableError(err));
+      }
+    }
+    return {doc: mergedDoc, alreadyTerminal: true};
+  }
+
+  const record: AsaasBuyerRecord = {
+    paymentId: params.paymentId,
+    planId: params.planId,
+    status: params.status,
+    amount: params.amount,
+    ...(params.billingType ? {billingType: params.billingType} : {}),
+    ...(params.customerId ? {customerId: params.customerId} : {}),
+    buyer: {
+      name: params.buyer.name || '',
+      phone: params.buyer.phone || '',
+      email: params.buyer.email || '',
+      ...(params.buyer.cpfCnpj ? {cpfCnpj: params.buyer.cpfCnpj} : {}),
+    },
+    ...(params.ref ? {ref: params.ref} : {}),
+    callGrant: {
+      tokenHash: hashEntitlementToken(params.token),
+      used: existing?.callGrant?.used ?? false,
+      ...(existing?.callGrant?.usedAt ? {usedAt: existing.callGrant.usedAt} : {}),
+      expiresAt: new Date(params.expiresAtMs).toISOString(),
+    },
+    childSubmission: existing?.childSubmission ?? null,
+    timestamps: {
+      createdAt: existing?.timestamps?.createdAt || nowIso,
+      paidAt: existing?.timestamps?.paidAt || params.paidAt || nowIso,
+      updatedAt: nowIso,
+    },
+  };
+
+  asaasBuyersFallbackMap.set(params.paymentId, record);
+  const db = getFirestoreDb();
+  if (db) {
+    try {
+      await db.collection(ASAAS_BUYERS_COLLECTION).doc(params.paymentId).set(record, {merge: true});
+    } catch (err) {
+      console.warn('Firestore write failed for asaas_buyers:', extractReadableError(err));
+    }
+  }
+  return {doc: record, alreadyTerminal: false};
+}
+
+async function recordChildSubmissionForPayment(
+  paymentId: string | undefined,
+  submission: {
+    childName: string;
+    childAge?: string;
+    praise?: string;
+    advice?: string;
+    farewellType?: string;
+    planId: PlanId;
+  }
+): Promise<void> {
+  if (!paymentId || paymentId.startsWith('debug_') || paymentId.startsWith('credit_')) {
+    return;
+  }
+  if (!/^[A-Za-z0-9_-]{3,80}$/.test(paymentId)) {
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  const childSubmission = {
+    childName: submission.childName,
+    ...(submission.childAge ? {childAge: submission.childAge} : {}),
+    ...(submission.praise ? {praise: submission.praise} : {}),
+    ...(submission.advice ? {advice: submission.advice} : {}),
+    ...(submission.farewellType ? {farewellType: submission.farewellType} : {}),
+    planId: submission.planId,
+    submittedAt: nowIso,
+  };
+
+  const memExisting = asaasBuyersFallbackMap.get(paymentId);
+  if (memExisting) {
+    memExisting.childSubmission = childSubmission;
+    memExisting.callGrant = {
+      ...memExisting.callGrant,
+      used: true,
+      usedAt: memExisting.callGrant.usedAt || nowIso,
+    };
+    memExisting.timestamps = {
+      ...memExisting.timestamps,
+      updatedAt: nowIso,
+    };
+  }
+
+  const db = getFirestoreDb();
+  if (db) {
+    try {
+      const docRef = db.collection(ASAAS_BUYERS_COLLECTION).doc(paymentId);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        await docRef.set(
+          {
+            childSubmission,
+            callGrant: {
+              used: true,
+              usedAt: nowIso,
+            },
+            timestamps: {
+              updatedAt: nowIso,
+            },
+          },
+          {merge: true}
+        );
+      }
+    } catch (err) {
+      console.warn('Firestore childSubmission update failed:', extractReadableError(err));
+    }
+  }
+}
+
 function getAsaasApiBaseUrl(): string {
   const custom = (process.env.ASAAS_API_URL || '').trim().replace(/\/$/, '');
   if (custom && /^https?:\/\//i.test(custom)) {
@@ -195,10 +553,6 @@ function signEntitlementToken(payload: EntitlementPayload): string {
   const encoded = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
   const sig = crypto.createHmac('sha256', getHmacSecret()).update(encoded).digest('base64url');
   return `${encoded}.${sig}`;
-}
-
-function isDebugUnlockAllowed(): boolean {
-  return !isProd || (process.env.ENABLE_DEBUG_UNLOCK || '').trim().toLowerCase() === 'true';
 }
 
 function isPlanAuthorizedByToken(
@@ -1639,6 +1993,16 @@ function pickNonRepeatingReplyFallback(childName: string, history: ChatTurn[]): 
 
 function resolvePublicBaseUrl(req: Request): string {
   const reqHost = (req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim();
+  const forwardedProto = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
+  const hostWithoutPort = reqHost.split(':')[0].toLowerCase();
+  const isLocalHost = hostWithoutPort === 'localhost' || hostWithoutPort === '127.0.0.1';
+  const isInternalHost = !hostWithoutPort || hostWithoutPort === '0.0.0.0';
+
+  if (!isInternalHost) {
+    const proto = forwardedProto || (isLocalHost ? 'http' : req.protocol || 'https');
+    return `${proto}://${reqHost}`;
+  }
+
   const envAppUrl = (process.env.APP_URL || '').trim().replace(/\/$/, '');
   if (envAppUrl && envAppUrl !== 'MY_APP_URL' && /^https?:\/\//i.test(envAppUrl)) {
     return envAppUrl;
@@ -1647,10 +2011,7 @@ function resolvePublicBaseUrl(req: Request): string {
   if (reqOrigin && /^https?:\/\//i.test(reqOrigin)) {
     return reqOrigin.replace(/\/$/, '');
   }
-  const forwardedProto = (req.get('x-forwarded-proto') || '').split(',')[0].trim();
-  const proto = forwardedProto || req.protocol || 'https';
-  const host = reqHost || 'localhost:3000';
-  return `${proto}://${host}`;
+  return 'http://localhost:3000';
 }
 
 function applyAppUrlToHtml(html: string, baseUrl: string): string {
@@ -2022,13 +2383,87 @@ async function startServer() {
     });
   });
 
-  app.post('/api/pay/asaas', (req: Request, res: Response) => {
+  app.post('/api/pay/create-link', async (req: Request, res: Response) => {
+    try {
+      const body = (req.body || {}) as {planId?: unknown; ref?: unknown};
+      const rawPlanId = typeof body.planId === 'string' ? body.planId.trim() : '';
+      if (!rawPlanId || !(rawPlanId in PLAN_PRICES_BRL)) {
+        res.status(400).json({error: 'planId inválido. Escolha 15s, 30s, 60s, familia ou audio.'});
+        return;
+      }
+
+      const planId = rawPlanId as PlanId;
+      const planSpec = PLAN_PRICES_BRL[planId];
+      const refId = sanitizeRefId(body.ref);
+      const asaasApiKey = (process.env.ASAAS_API_KEY || '').trim();
+
+      if (!asaasApiKey) {
+        const staticLink = getAsaasPlanLinks()[planId];
+        if (staticLink) {
+          res.json({url: staticLink, planId, source: 'static-link'});
+          return;
+        }
+        res.status(503).json({
+          error: 'ASAAS_API_KEY não configurada no servidor para criação dinâmica de link.',
+        });
+        return;
+      }
+
+      const externalReference = refId ? `plan:${planId}|ref:${refId}` : planId;
+      const abortCtrl = new AbortController();
+      const timeout = setTimeout(() => abortCtrl.abort(), 8000);
+      try {
+        const apiRes = await fetch(`${getAsaasApiBaseUrl()}/paymentLinks`, {
+          method: 'POST',
+          headers: {
+            access_token: asaasApiKey,
+            'Content-Type': 'application/json',
+            'User-Agent': 'aistudio-build',
+          },
+          body: JSON.stringify({
+            name: `Chamada Mágica - Plano ${planId.toUpperCase()}`,
+            description: 'Videochamada personalizada do Papai Noel',
+            value: planSpec.value,
+            billingType: 'UNDEFINED',
+            chargeType: 'DETACHED',
+            externalReference,
+          }),
+          signal: abortCtrl.signal,
+        });
+
+        const json = (await apiRes.json().catch(() => ({}))) as {
+          id?: string;
+          url?: string;
+          errors?: Array<{description?: string}>;
+        };
+        if (!apiRes.ok || !json.url) {
+          const detail = json.errors?.[0]?.description || `HTTP ${apiRes.status}`;
+          res.status(502).json({error: `Falha ao criar link Asaas: ${detail}`});
+          return;
+        }
+
+        res.json({
+          id: json.id,
+          url: json.url,
+          planId,
+          value: planSpec.value,
+          source: 'asaas-api',
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
+    } catch (err) {
+      res.status(500).json({error: extractReadableError(err)});
+    }
+  });
+
+  app.post('/api/pay/asaas', async (req: Request, res: Response) => {
     const webhookSecret = (process.env.ASAAS_WEBHOOK_TOKEN || '').trim();
     const envSecret = (process.env.SECRET || '').trim();
     const authSecret = webhookSecret || envSecret;
 
     if (!authSecret) {
-      res.status(503).json({error: 'ASAAS_WEBHOOK_TOKEN ou SECRET não configurado no servidor.'});
+      res.status(503).json({error: 'ASAAS_WEBHOOK_TOKEN não configurado no servidor.'});
       return;
     }
 
@@ -2069,8 +2504,11 @@ async function startServer() {
       id?: string;
       status?: string;
       value?: number;
+      billingType?: string;
       description?: string;
       externalReference?: string;
+      customer?: string;
+      paymentDate?: string;
       customerEmail?: string;
       customerName?: string;
     }
@@ -2085,54 +2523,113 @@ async function startServer() {
     const event = (body.event || '').toUpperCase();
     const status = (payment.status || '').toUpperCase();
 
-    const isPaidEvent =
-      event === 'PAYMENT_CONFIRMED' ||
-      event === 'PAYMENT_RECEIVED' ||
-      event === 'PAYMENT_RECEIVED_IN_CASH' ||
-      status === 'CONFIRMED' ||
-      status === 'RECEIVED' ||
-      status === 'RECEIVED_IN_CASH' ||
-      status === 'PAID';
-
     if (!paymentId || !/^[A-Za-z0-9_-]{3,80}$/.test(paymentId)) {
       res.status(400).json({error: 'payment.id inválido no payload Asaas.'});
       return;
     }
 
+    const isPaidEvent = isAsaasPaidStatus(event) || isAsaasPaidStatus(status);
     if (!isPaidEvent) {
       res.json({ok: true, received: true, paid: false, paymentId, status});
       return;
     }
 
-    const existing = paidPayments.get(paymentId);
+    const existingDoc = await getAsaasBuyerDoc(paymentId);
+    const existingMem = paidPayments.get(paymentId);
+    if (existingDoc && isAsaasPaidStatus(existingDoc.status) && existingDoc.callGrant?.tokenHash) {
+      if (existingMem?.token) {
+        res.json({
+          ok: true,
+          received: true,
+          paid: true,
+          idempotent: true,
+          paymentId,
+          planId: existingDoc.planId,
+          token: existingMem.token,
+        });
+        return;
+      }
+      res.json({
+        ok: true,
+        received: true,
+        paid: true,
+        idempotent: true,
+        paymentId,
+        planId: existingDoc.planId,
+      });
+      return;
+    }
+
     const planId =
-      existing?.planId ||
+      existingMem?.planId ||
       inferPlanIdFromPayment({
         externalReference: payment.externalReference,
         description: payment.description,
         value: payment.value,
       });
-    const ref = existing?.ref || extractRefFromExternalReference(payment.externalReference);
+
+    const amountCheck = validatePaymentAmount(planId, payment.value);
+    if (!amountCheck.ok) {
+      res.status(400).json({
+        error: `Valor do pagamento divergente para o plano ${planId}: esperado >= R$ ${amountCheck.expected.toFixed(2)}.`,
+      });
+      return;
+    }
+
+    const asaasApiKey = (process.env.ASAAS_API_KEY || '').trim();
+    const fetchedCustomer = await fetchAsaasCustomer(payment.customer, asaasApiKey);
+    const buyer = {
+      name: fetchedCustomer.name || payment.customerName || existingMem?.customerName || '',
+      phone: fetchedCustomer.phone || '',
+      email: (fetchedCustomer.email || payment.customerEmail || existingMem?.customerEmail || '').toLowerCase(),
+      ...(fetchedCustomer.cpfCnpj ? {cpfCnpj: fetchedCustomer.cpfCnpj} : {}),
+    };
+
+    const ref = existingMem?.ref || extractRefFromExternalReference(payment.externalReference);
+    const now = Date.now();
+    const expiresAtMs = now + 7 * 24 * 60 * 60 * 1000;
     const token =
-      existing?.token ||
+      existingMem?.token ||
       signEntitlementToken({
         pid: paymentId,
         plan: planId,
-        iat: Date.now(),
-        exp: Date.now() + 30 * 24 * 60 * 60 * 1000,
+        planId,
+        paid: true,
+        iat: now,
+        exp: expiresAtMs,
+        expiresAt: expiresAtMs,
         ...(ref ? {ref} : {}),
       });
+
+    const finalAmount =
+      typeof payment.value === 'number' && Number.isFinite(payment.value)
+        ? payment.value
+        : PLAN_PRICES_BRL[planId].value;
+
+    await persistAsaasBuyerRecord({
+      paymentId,
+      planId,
+      status: status || 'CONFIRMED',
+      amount: finalAmount,
+      billingType: typeof payment.billingType === 'string' ? payment.billingType : undefined,
+      customerId: typeof payment.customer === 'string' ? payment.customer : undefined,
+      buyer,
+      ref,
+      token,
+      expiresAtMs,
+      paidAt: typeof payment.paymentDate === 'string' ? payment.paymentDate : undefined,
+    });
 
     paidPayments.set(paymentId, {
       paymentId,
       planId,
       status: status || 'CONFIRMED',
-      value: typeof payment.value === 'number' ? payment.value : existing?.value,
-      customerEmail: payment.customerEmail || existing?.customerEmail,
-      customerName: payment.customerName || existing?.customerName,
+      value: finalAmount,
+      customerEmail: buyer.email || undefined,
+      customerName: buyer.name || undefined,
       ref,
       verifiedAt: new Date().toISOString(),
-      source: existing?.source === 'api' ? 'both' : existing?.source || 'webhook',
+      source: existingMem?.source === 'api' ? 'both' : existingMem?.source || 'webhook',
       token,
     });
 
@@ -2153,6 +2650,7 @@ async function startServer() {
       }
 
       const webhookRecord = paidPayments.get(paymentId);
+      const existingBuyer = await getAsaasBuyerDoc(paymentId);
       const asaasApiKey = (process.env.ASAAS_API_KEY || '').trim();
       const incomingRef = sanitizeRefId(body.ref);
 
@@ -2160,38 +2658,47 @@ async function startServer() {
       let apiPaymentData: {
         status?: string;
         value?: number;
+        billingType?: string;
         description?: string;
         externalReference?: string;
+        customer?: string;
+        paymentDate?: string;
       } | null = null;
 
       if (asaasApiKey) {
-        const apiRes = await fetch(
-          `${getAsaasApiBaseUrl()}/payments/${encodeURIComponent(paymentId)}`,
-          {
-            method: 'GET',
-            headers: {
-              access_token: asaasApiKey,
-              'User-Agent': 'aistudio-build',
-            },
+        const abortCtrl = new AbortController();
+        const timeout = setTimeout(() => abortCtrl.abort(), 8000);
+        try {
+          const apiRes = await fetch(
+            `${getAsaasApiBaseUrl()}/payments/${encodeURIComponent(paymentId)}`,
+            {
+              method: 'GET',
+              headers: {
+                access_token: asaasApiKey,
+                'User-Agent': 'aistudio-build',
+              },
+              signal: abortCtrl.signal,
+            }
+          );
+          if (apiRes.ok) {
+            apiPaymentData = (await apiRes.json()) as {
+              status?: string;
+              value?: number;
+              billingType?: string;
+              description?: string;
+              externalReference?: string;
+              customer?: string;
+              paymentDate?: string;
+            };
+            apiConfirmed = isAsaasPaidStatus(apiPaymentData.status);
           }
-        );
-        if (apiRes.ok) {
-          apiPaymentData = (await apiRes.json()) as {
-            status?: string;
-            value?: number;
-            description?: string;
-            externalReference?: string;
-          };
-          const apiStatus = (apiPaymentData.status || '').toUpperCase();
-          apiConfirmed =
-            apiStatus === 'RECEIVED' ||
-            apiStatus === 'CONFIRMED' ||
-            apiStatus === 'RECEIVED_IN_CASH' ||
-            apiStatus === 'PAID';
+        } finally {
+          clearTimeout(timeout);
         }
       }
 
-      const isConfirmed = apiConfirmed || Boolean(webhookRecord);
+      const existingPaid = Boolean(existingBuyer && isAsaasPaidStatus(existingBuyer.status));
+      const isConfirmed = apiConfirmed || Boolean(webhookRecord) || existingPaid;
       if (!isConfirmed) {
         res.status(402).json({
           paid: false,
@@ -2203,6 +2710,7 @@ async function startServer() {
       }
 
       const finalPlanId =
+        existingBuyer?.planId ||
         webhookRecord?.planId ||
         inferPlanIdFromPayment({
           requestedPlanId: body.planId,
@@ -2211,29 +2719,82 @@ async function startServer() {
           value: apiPaymentData?.value,
         });
 
+      const finalValue = apiPaymentData?.value ?? webhookRecord?.value ?? existingBuyer?.amount;
+      const amountCheck = validatePaymentAmount(finalPlanId, finalValue);
+      if (!amountCheck.ok) {
+        res.status(400).json({
+          paid: false,
+          error: `Valor do pagamento divergente para o plano ${finalPlanId}.`,
+        });
+        return;
+      }
+
       const finalRef =
+        existingBuyer?.ref ||
         webhookRecord?.ref ||
         extractRefFromExternalReference(apiPaymentData?.externalReference) ||
         incomingRef;
 
+      const fetchedCustomer = apiPaymentData?.customer
+        ? await fetchAsaasCustomer(apiPaymentData.customer, asaasApiKey)
+        : {name: '', phone: '', email: ''};
+      const buyer = {
+        name: fetchedCustomer.name || existingBuyer?.buyer?.name || webhookRecord?.customerName || '',
+        phone: fetchedCustomer.phone || existingBuyer?.buyer?.phone || '',
+        email: (
+          fetchedCustomer.email ||
+          existingBuyer?.buyer?.email ||
+          webhookRecord?.customerEmail ||
+          ''
+        ).toLowerCase(),
+        ...(fetchedCustomer.cpfCnpj || existingBuyer?.buyer?.cpfCnpj
+          ? {cpfCnpj: fetchedCustomer.cpfCnpj || existingBuyer?.buyer?.cpfCnpj}
+          : {}),
+      };
+
+      const now = Date.now();
+      const expiresAtMs = now + 7 * 24 * 60 * 60 * 1000;
       const token =
         webhookRecord?.token ||
         signEntitlementToken({
           pid: paymentId,
           plan: finalPlanId,
-          iat: Date.now(),
-          exp: Date.now() + 30 * 24 * 60 * 60 * 1000,
+          planId: finalPlanId,
+          paid: true,
+          iat: now,
+          exp: expiresAtMs,
+          expiresAt: expiresAtMs,
           ...(finalRef ? {ref: finalRef} : {}),
         });
 
       const source: PaidPaymentRecord['source'] =
         apiConfirmed && webhookRecord ? 'both' : apiConfirmed ? 'api' : 'webhook';
+      const resolvedAmount =
+        typeof finalValue === 'number' && Number.isFinite(finalValue)
+          ? finalValue
+          : PLAN_PRICES_BRL[finalPlanId].value;
+
+      await persistAsaasBuyerRecord({
+        paymentId,
+        planId: finalPlanId,
+        status: apiPaymentData?.status || existingBuyer?.status || webhookRecord?.status || 'CONFIRMED',
+        amount: resolvedAmount,
+        billingType: apiPaymentData?.billingType || existingBuyer?.billingType,
+        customerId: apiPaymentData?.customer || existingBuyer?.customerId,
+        buyer,
+        ref: finalRef,
+        token,
+        expiresAtMs,
+        paidAt: apiPaymentData?.paymentDate || existingBuyer?.timestamps?.paidAt,
+      });
 
       paidPayments.set(paymentId, {
         paymentId,
         planId: finalPlanId,
-        status: apiPaymentData?.status || webhookRecord?.status || 'CONFIRMED',
-        value: apiPaymentData?.value ?? webhookRecord?.value,
+        status: apiPaymentData?.status || existingBuyer?.status || webhookRecord?.status || 'CONFIRMED',
+        value: resolvedAmount,
+        customerName: buyer.name || undefined,
+        customerEmail: buyer.email || undefined,
         ref: finalRef,
         verifiedAt: new Date().toISOString(),
         source,
@@ -2244,6 +2805,7 @@ async function startServer() {
         recordReferralConversion(finalRef, paymentId);
       }
 
+      const magicLink = `/?chamada=true&token=${encodeURIComponent(token)}`;
       res.json({
         paid: true,
         doubleConfirmed: apiConfirmed || source === 'webhook' || source === 'both',
@@ -2251,6 +2813,7 @@ async function startServer() {
         paymentId,
         planId: finalPlanId,
         token,
+        magicLink,
         ...(finalRef ? {ref: finalRef} : {}),
       });
     } catch (err) {
@@ -2754,7 +3317,92 @@ async function startServer() {
     });
   });
 
-  // Global Debug Mode Status & Unlock Routes (for testing without Asaas checkout in dev)
+  app.get('/api/admin/buyers', async (req: Request, res: Response) => {
+    if (!requireAdminToken(req, res)) return;
+
+    try {
+      const db = getFirestoreDb();
+      let records: AsaasBuyerRecord[] = [];
+      let source: 'firestore' | 'memory' = 'memory';
+
+      if (db) {
+        source = 'firestore';
+        try {
+          const snap = await db
+            .collection(ASAAS_BUYERS_COLLECTION)
+            .orderBy('timestamps.createdAt', 'desc')
+            .limit(200)
+            .get();
+          records = snap.docs.map((d) => d.data() as AsaasBuyerRecord);
+        } catch (err) {
+          console.warn('Firestore buyers query failed; using memory cache:', extractReadableError(err));
+          source = 'memory';
+          records = Array.from(asaasBuyersFallbackMap.values());
+        }
+      } else {
+        records = Array.from(asaasBuyersFallbackMap.values());
+      }
+
+      if (source === 'memory') {
+        records.sort((a, b) =>
+          (b.timestamps?.createdAt || '').localeCompare(a.timestamps?.createdAt || '')
+        );
+      }
+
+      res.json({
+        source,
+        buyers: records.map((r) => ({
+          paymentId: r.paymentId,
+          buyer: {
+            name: r.buyer?.name || '',
+            phone: r.buyer?.phone || '',
+            email: r.buyer?.email || '',
+            ...(r.buyer?.cpfCnpj ? {cpfCnpj: r.buyer.cpfCnpj} : {}),
+          },
+          planId: r.planId,
+          status: r.status,
+          amount: r.amount,
+          timestamps: r.timestamps,
+        })),
+      });
+    } catch (err) {
+      res.status(500).json({error: extractReadableError(err)});
+    }
+  });
+
+  app.get('/api/admin/buyers/:paymentId', async (req: Request, res: Response) => {
+    if (!requireAdminToken(req, res)) return;
+
+    const paymentId = typeof req.params.paymentId === 'string' ? req.params.paymentId.trim() : '';
+    if (!paymentId || !/^[A-Za-z0-9_-]{3,80}$/.test(paymentId)) {
+      res.status(400).json({error: 'paymentId inválido.'});
+      return;
+    }
+
+    try {
+      const record = await getAsaasBuyerDoc(paymentId);
+      if (!record) {
+        res.status(404).json({error: 'Comprador não encontrado.'});
+        return;
+      }
+
+      res.json({
+        paymentId: record.paymentId,
+        buyer: record.buyer,
+        planId: record.planId,
+        status: record.status,
+        amount: record.amount,
+        billingType: record.billingType,
+        childSubmission: record.childSubmission ?? null,
+        callGrant: record.callGrant ?? null,
+        timestamps: record.timestamps,
+      });
+    } catch (err) {
+      res.status(500).json({error: extractReadableError(err)});
+    }
+  });
+
+  // Global Debug Mode Status & Unlock Routes (works across localhost, ais-pre, and custom domains)
   app.get('/api/debug/status', (_req: Request, res: Response) => {
     const hasEnv = (name: string): boolean => Boolean((process.env[name] || '').trim());
     const configured: Record<string, boolean> = {
@@ -2768,6 +3416,7 @@ async function startServer() {
       ASAAS_LINK_60S: hasEnv('ASAAS_LINK_60S'),
       ASAAS_LINK_FAMILIA: hasEnv('ASAAS_LINK_FAMILIA'),
       ASAAS_LINK_AUDIO: hasEnv('ASAAS_LINK_AUDIO'),
+      FIREBASE_SERVICE_ACCOUNT_JSON: Boolean(getFirestoreDb()) || hasEnv('FIREBASE_SERVICE_ACCOUNT_JSON'),
       RESEND_API_KEY: hasEnv('RESEND_API_KEY'),
       OWNER_EMAIL: hasEnv('OWNER_EMAIL'),
       APP_URL: hasEnv('APP_URL'),
@@ -2777,7 +3426,8 @@ async function startServer() {
       .map(([name]) => name);
 
     res.json({
-      debugActive: isDebugUnlockAllowed(),
+      debugActive: true,
+      requiresAdminToken: configured.ADMIN_TOKEN || isProd,
       environment: isProd ? 'production' : 'development',
       missingEnvVars,
       configured,
@@ -2786,13 +3436,31 @@ async function startServer() {
 
   app.post('/api/debug/unlock-all-plans', (req: Request, res: Response) => {
     const expectedAdmin = (process.env.ADMIN_TOKEN || '').trim();
-    const providedAdmin = (req.get('x-admin-token') || '').trim();
-    const hasAdminOverride =
-      Boolean(expectedAdmin && providedAdmin && timingSafeStringEqual(providedAdmin, expectedAdmin));
+    const providedHeader = (req.get('x-admin-token') || '').trim();
+    const hasQueryDebug = String(req.query.debug || '').trim().toLowerCase() === 'true';
+    const providedQueryToken =
+      typeof req.query.adminToken === 'string' ? req.query.adminToken.trim() : '';
 
-    if (!isDebugUnlockAllowed() && !hasAdminOverride) {
-      res.status(403).json({
-        error: 'Modo Debug Global desabilitado em produção.',
+    if (expectedAdmin) {
+      const headerMatch =
+        Boolean(providedHeader) && timingSafeStringEqual(providedHeader, expectedAdmin);
+      const queryMatch =
+        hasQueryDebug &&
+        Boolean(providedQueryToken) &&
+        timingSafeStringEqual(providedQueryToken, expectedAdmin);
+
+      if (!headerMatch && !queryMatch) {
+        res.status(401).json({
+          error: 'Token de administrador (ADMIN_TOKEN) ausente ou inválido.',
+          requiresAdminToken: true,
+        });
+        return;
+      }
+    } else if (isProd) {
+      res.status(401).json({
+        error:
+          'ADMIN_TOKEN não configurado no servidor. Defina ADMIN_TOKEN nas variáveis de ambiente para liberar o Modo Teste fora do desenvolvimento.',
+        requiresAdminToken: true,
       });
       return;
     }
@@ -2811,10 +3479,13 @@ async function startServer() {
       debugAllPlans: true,
     };
     const token = signEntitlementToken(payload);
+    const baseUrl = resolvePublicBaseUrl(req);
+    const debugUrl = `${baseUrl}/?chamada=true&token=${encodeURIComponent(token)}`;
 
     res.json({
       ok: true,
       token,
+      debugUrl,
       planId: payload.planId,
       childName: payload.childName,
       paid: payload.paid,
@@ -3038,6 +3709,14 @@ async function startServer() {
         cached.farewellAudioBase64 &&
         (isQuick15sPlan || cached.bridgeAudioBase64)
       ) {
+        void recordChildSubmissionForPayment(entitlement.pid, {
+          childName,
+          childAge,
+          praise,
+          advice,
+          farewellType,
+          planId,
+        });
         res.json(cached);
         return;
       }
@@ -3281,6 +3960,15 @@ Instruções para farewellText (ATO 3 — despedida final curta, NO MÁXIMO 90 c
       ) {
         setLimitedCache(greetingCache, cacheKey, payload);
       }
+
+      void recordChildSubmissionForPayment(entitlement.pid, {
+        childName,
+        childAge,
+        praise,
+        advice,
+        farewellType,
+        planId,
+      });
 
       res.json(payload);
     } catch (error) {
@@ -3658,6 +4346,13 @@ REGRAS OBRIGATÓRIAS:
 
       const cached = audioMagicCache.get(cacheKey);
       if (cached && cached.audioBase64) {
+        void recordChildSubmissionForPayment(entitlement.pid, {
+          childName,
+          childAge,
+          praise,
+          advice,
+          planId: 'audio',
+        });
         res.json({
           audioBase64: cached.audioBase64,
           audioMimeType: cached.audioMimeType,
@@ -3741,6 +4436,14 @@ REGRAS OBRIGATÓRIAS:
       const isQuotaError = Boolean(
         synth.ttsError && /429|RESOURCE_EXHAUSTED|limite|cota/i.test(synth.ttsError)
       );
+
+      void recordChildSubmissionForPayment(entitlement.pid, {
+        childName,
+        childAge,
+        praise,
+        advice,
+        planId: 'audio',
+      });
 
       res.json({
         audioBase64: synth.audioBase64,
